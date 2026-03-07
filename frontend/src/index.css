@@ -1,0 +1,125 @@
+@import "tailwindcss";
+
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap');
+
+@theme {
+  --color-wa-teal: #00a884;
+  --color-wa-dark: #0b141a;
+  --color-wa-sidebar: #111b21;
+  --color-wa-card: #202c33;
+  --color-wa-hover: #2a3942;
+  --color-wa-sent: #005c4b;
+  --color-wa-received: #202c33;
+  --color-wa-bg: #efeae2;
+  --color-wa-light: #f0f2f5;
+  --color-wa-message-sent: #d9fdd3;
+  --color-glass-border: rgba(255, 255, 255, 0.4);
+
+  /* Mapping legacy/generic names if needed */
+  --color-primary-bg: #0f172a;
+  --color-secondary-bg: #1e293b;
+  --color-accent-color: #3b82f6;
+  --color-accent-hover: #2563eb;
+  --color-success-color: #10b981;
+  --color-error-color: #ef4444;
+  --color-text-primary: #111b21;
+  --color-text-secondary: #54656f;
+}
+
+:root {
+  /* Light Mode Glass Variables - Optimized for visibility */
+  --glass-bg: rgba(255, 255, 255, 0.7);
+  --glass-border: rgba(255, 255, 255, 0.4);
+  --glass-shadow: 0 4px 24px 0 rgba(0, 0, 0, 0.05);
+  --border-radius: 1.5rem;
+  --font-main: 'Outfit', 'Inter', system-ui, -apple-system, sans-serif;
+
+  /* Legacy Vars mapped to new theme */
+  --primary-bg: #f0f2f5;
+  --secondary-bg: #ffffff;
+  --accent-color: #00a884;
+  --accent-hover: #008f6f;
+  --text-primary: #111b21;
+  --text-secondary: #54656f;
+  --wa-sent-bubble: #d9fdd3;
+  --wa-received-bubble: #ffffff;
+}
+
+body {
+  font-family: var(--font-main);
+  background-color: var(--color-wa-light);
+  color: var(--text-primary);
+  margin: 0;
+  overflow-x: hidden;
+}
+
+/* 
+  Glass Card Utility
+  Ensures cards are visible on light backgrounds 
+*/
+.glass-card {
+  background-color: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--border-radius);
+  box-shadow: var(--glass-shadow);
+}
+
+/* Custom Scrollbar */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 20px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(0, 0, 0, 0.05);
+  background-clip: content-box;
+}
+
+/* Base Layout Container */
+.app-container {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background-color: var(--color-wa-light);
+  position: relative;
+}
+
+/* Background Texture */
+.app-container::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background-image: url("data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%2300a884' fill-opacity='0.05'%3E%3Cpath d='M36 34v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zm0-30V0h-2v4h-4v2h4v4h2V6h4V4h-4zM6 34v-4H4v4H0v2h4v4h2v-4h4v-2H6zM6 4V0H4v4H0v2h4v4h2V6h4V4H6z'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E");
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* Chat Bubbles Override */
+.chat-bubble-wrapper.sent .chat-bubble {
+  background-color: var(--wa-sent-bubble);
+  color: var(--text-primary);
+  box-shadow: 0 1px 0.5px rgba(0, 0, 0, 0.13);
+}
+
+.chat-bubble-wrapper.received .chat-bubble {
+  background-color: var(--wa-received-bubble);
+  color: var(--text-primary);
+  box-shadow: 0 1px 0.5px rgba(0, 0, 0, 0.13);
+}

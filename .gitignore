@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+
+# WhatsApp Session/Cache
+backend/.wwebjs_auth/
+backend/.wwebjs_cache/
+
+# Build and Temporary
+frontend/dist/
+backend/uploads/
+*.log
+.env
+.env.local
+.DS_Store

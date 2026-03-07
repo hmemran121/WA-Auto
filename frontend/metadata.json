@@ -1,0 +1,7 @@
+{
+  "name": "WhatsApp Automation Dashboard",
+  "description": "A sophisticated web application to manage WhatsApp automation, featuring QR code connection simulation, dynamic message generation using Gemini AI, and contact management.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

@@ -1,0 +1,34 @@
+{
+    "files.exclude": {
+        "**/node_modules": true,
+        "**/.wwebjs_auth": true,
+        "**/.wwebjs_cache": true,
+        "**/dist": true,
+        "**/uploads": true,
+        "**/coverage": true,
+        "**/*.db": true,
+        "**/*.db-*": true,
+        "**/*.log": true
+    },
+    "search.exclude": {
+        "**/node_modules": true,
+        "**/.wwebjs_auth": true,
+        "**/.wwebjs_cache": true,
+        "**/dist": true,
+        "**/uploads": true,
+        "**/coverage": true,
+        "**/*.db": true,
+        "**/*.log": true
+    },
+    "files.watcherExclude": {
+        "**/node_modules/*/**": true,
+        "**/.wwebjs_auth/*/**": true,
+        "**/.wwebjs_cache/*/**": true,
+        "**/dist/*/**": true,
+        "**/uploads/*/**": true,
+        "**/coverage/*/**": true,
+        "**/*.db": true,
+        "**/*.log": true
+    },
+    "typescript.disableAutomaticTypeAcquisition": true
+}

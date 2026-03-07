@@ -1,0 +1,21 @@
+{
+    "compilerOptions": {
+        "module": "CommonJS",
+        "target": "ESNext",
+        "checkJs": false,
+        "resolveJsonModule": true,
+        "allowJs": true
+    },
+    "exclude": [
+        "node_modules",
+        ".wwebjs_auth",
+        ".wwebjs_cache",
+        "uploads",
+        "coverage",
+        "*.db",
+        "*.db-shm",
+        "*.db-wal",
+        "*.log",
+        "test_results*"
+    ]
+}

@@ -1,0 +1,12 @@
+{
+    "ignore": [
+        "data.db",
+        "data.db-journal",
+        "data.db-wal",
+        "data.db-shm",
+        "uploads/*",
+        "*.log"
+    ],
+    "ext": "js,jsx,json,ts,tsx",
+    "delay": "1000"
+}
