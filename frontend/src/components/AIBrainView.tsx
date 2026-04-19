@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
 import {
     BrainCircuit,
@@ -13,18 +13,38 @@ import {
     CheckCircle2, MessageSquare, AlertCircle, ShoppingCart,
     Database, Link, ExternalLink, ArrowRight, Star, Settings, ChevronRight, Zap, Target, MousePointer2,
     Sparkles, Tag, TrendingUp, Cpu, Activity, Globe, Search, Filter, X, Layers, Info,
-    ChevronLeft, ShoppingBag
+    ChevronLeft, ShoppingBag, History as HistoryIcon, Clock
 } from 'lucide-react';
 import ProcessModal from './ProcessModal';
 
 export default function AIBrainView() {
-    const [activeTab, setActiveTab] = useState<'profile' | 'products' | 'knowledge'>('profile');
+    const [activeTab, setActiveTab] = useState<'profile' | 'products' | 'knowledge' | 'analytics' | 'logs'>('profile');
     const [loading, setLoading] = useState(false);
 
     // States
     const [profile, setProfile] = useState<any>({});
     const [products, setProducts] = useState<any[]>([]);
     const [knowledge, setKnowledge] = useState<any[]>([]);
+    const [pagination, setPagination] = useState({ total: 0, pendingTotal: 0, page: 1, limit: 50, totalPages: 0 });
+    const [isFetchingMore, setIsFetchingMore] = useState(false);
+
+    // AI Command Center States
+    const [aiLogs, setAiLogs] = useState<any[]>([]);
+    const [aiAnalytics, setAiAnalytics] = useState<any>({
+        total_replies: 0,
+        handover_rate: 0,
+        avg_confidence: 0,
+        daily_trends: []
+    });
+    const [logsPagination, setLogsPagination] = useState({ total: 0, page: 1, limit: 50 });
+    const [selectedLog, setSelectedLog] = useState<any>(null);
+
+    // 🔒 VECTOR SYNC CONFIRMATION MODAL STATE
+    const [confirmModal, setConfirmModal] = useState<{
+        open: boolean;
+        type: 'products' | 'profile' | 'knowledge' | null;
+        onConfirm: (() => void) | null;
+    }>({ open: false, type: null, onConfirm: null });
 
     // Process Modal States
     const [processModalOpen, setProcessModalOpen] = useState(false);
@@ -33,9 +53,11 @@ export default function AIBrainView() {
     const [processTotal, setProcessTotal] = useState(50);
     const [processStatus, setProcessStatus] = useState<'processing' | 'completed' | 'failed'>('processing');
     const [currentProcessId, setCurrentProcessId] = useState<string | null>(null);
+    const [discoveries, setDiscoveries] = useState<number>(0);
 
     useEffect(() => {
         fetchProfile();
+        fetchProducts(1); // Proactively fetch products count for the sync badge
 
         const socket = (window as any).socket;
         if (!socket) return;
@@ -83,22 +105,45 @@ export default function AIBrainView() {
                     type: data.status === 'completed' ? 'success' : 'error',
                     timestamp: new Date().toLocaleTimeString()
                 }]);
+                
+                // Refresh data
+                if (activeTab === 'profile') fetchProfile();
+                // Always refresh products count for the sync badge regardless of active tab
+                fetchProducts(1);
+                if (activeTab === 'knowledge') fetchKnowledge();
             }
         });
 
         socket.on('new_ai_product_scraped', (data: any) => {
+            // v15.0 Enterprise: Optimization to prevent browser RAM bloat
+            // Instead of injecting 5,000 products into React state (which consumes ~2GB RAM),
+            // we increment the total count and show a "New Discoveries" signal.
+            setPagination(prev => ({ 
+                ...prev, 
+                total: prev.total + 1, 
+                pendingTotal: prev.pendingTotal + 1 
+            }));
+            
+            // Only update products list if we are on page 1 and have very few items
+            // This allows the user to see initial progress without crashing the browser.
             setProducts(prev => {
-                const exists = prev.find(p => p.id === data.product.id || p.name === data.product.name);
-                if (exists) {
-                    return prev.map(p => (p.id === data.product.id || p.name === data.product.name) ? { ...p, ...data.product } : p);
+                if (prev.length < 20 && pagination.page === 1) {
+                    const exists = prev.find(p => p.id === data.product.id || p.name === data.product.name);
+                    if (exists) return prev.map(p => (p.id === data.product.id || p.name === data.product.name) ? { ...p, ...data.product } : p);
+                    return [data.product, ...prev];
                 }
-                return [data.product, ...prev];
+                return prev;
             });
+
+            setDiscoveries(prev => prev + 1);
         });
 
-        socket.on('ai_products_changed', () => {
-            if (activeTab === 'products') fetchProducts();
+        socket.on('intelligent_products_changed', () => {
+            if (activeTab === 'products') fetchProducts(1);
         });
+
+        if (activeTab === 'analytics') fetchAIAnalytics();
+        if (activeTab === 'logs') fetchAILogs(1);
 
         return () => {
             socket.off('process_start');
@@ -106,7 +151,7 @@ export default function AIBrainView() {
             socket.off('process_progress');
             socket.off('process_end');
             socket.off('new_ai_product_scraped');
-            socket.off('ai_products_changed');
+            socket.off('intelligent_products_changed');
         };
     }, [currentProcessId, activeTab]);
 
@@ -118,13 +163,33 @@ export default function AIBrainView() {
         } catch (e) { console.error(e); }
     };
 
-    const fetchProducts = async () => {
+    const fetchProducts = useCallback(async (page = 1, search = '') => {
+        if (page === 1) setLoading(true);
+        else setIsFetchingMore(true);
+
         try {
-            const res = await fetch('http://localhost:3001/api/ai-brain/products');
+            const limit = 50;
+            const offset = (page - 1) * limit;
+            const res = await fetch(`http://localhost:3001/api/ai-brain/products?limit=${limit}&offset=${offset}${search ? `&search=${encodeURIComponent(search)}` : ''}`);
             const data = await res.json();
-            if (data.success) setProducts(data.products || []);
+            if (data.success) {
+                if (page === 1) {
+                    setProducts(data.products || []);
+                } else {
+                    setProducts(prev => {
+                        // Avoid duplicates if any
+                        const existingIds = new Set(prev.map(p => p.id));
+                        const newProducts = (data.products || []).filter((p: any) => !existingIds.has(p.id));
+                        return [...prev, ...newProducts];
+                    });
+                }
+                if (data.pagination) setPagination(data.pagination);
+            }
         } catch (e) { console.error(e); }
-    };
+
+        setLoading(false);
+        setIsFetchingMore(false);
+    }, []);
 
     const fetchKnowledge = async () => {
         try {
@@ -134,38 +199,92 @@ export default function AIBrainView() {
         } catch (e) { console.error(e); }
     };
 
+    const fetchAILogs = async (page = 1) => {
+        setLoading(true);
+        try {
+            const limit = logsPagination.limit;
+            const offset = (page - 1) * limit;
+            const res = await fetch(`http://localhost:3001/api/ai-brain/logs?limit=${limit}&offset=${offset}`);
+            const data = await res.json();
+            if (data.success) {
+                setAiLogs(data.logs || []);
+                setLogsPagination(prev => ({ ...prev, total: data.total, page }));
+            }
+        } catch (e) { console.error(e); }
+        setLoading(false);
+    };
+
+    const fetchAIAnalytics = async () => {
+        setLoading(true);
+        try {
+            const res = await fetch('http://localhost:3001/api/ai-brain/analytics');
+            const data = await res.json();
+            if (data.success) setAiAnalytics(data.stats);
+        } catch (e) { console.error(e); }
+        setLoading(false);
+    };
+
     const syncBrain = async () => {
-        setLoading(true);
-        try {
-            const res = await fetch('http://localhost:3001/api/ai-brain/sync', { method: 'POST' });
-            const data = await res.json();
-            if (data.success) {
-                setCurrentProcessId(data.id);
-                setProcessModalOpen(true);
+        // 🔒 GUARD: Show confirmation modal before scraper sync
+        setConfirmModal({
+            open: true,
+            type: null,
+            onConfirm: async () => {
+                setConfirmModal({ open: false, type: null, onConfirm: null });
+                setLoading(true);
+                try {
+                    const res = await fetch('http://localhost:3001/api/ai-brain/sync', { method: 'POST' });
+                    const data = await res.json();
+                    if (data.success) {
+                        setCurrentProcessId(data.id);
+                        setProcessModalOpen(true);
+                    }
+                } catch (e) {
+                    alert('Sync failed');
+                }
+                setLoading(false);
             }
-        } catch (e) {
-            alert('Sync failed');
-        }
-        setLoading(false);
+        });
     };
 
-    const syncVectors = async (type: 'products' | 'profile' | 'knowledge' = 'products') => {
-        setLoading(true);
-        try {
-            const endpoint = `/api/ai-brain/vectors/sync-${type}`;
-            const res = await fetch(`http://localhost:3001${endpoint}`, { method: 'POST' });
-            const data = await res.json();
-            if (data.success) {
-                setCurrentProcessId(data.id);
-                setProcessModalOpen(true);
+    // 🔒 STRICT GUARD: ALL vector syncs go through this function
+    // This is the ONLY way to trigger vectorization from the UI
+    const syncVectors = (type: 'products' | 'profile' | 'knowledge' = 'products') => {
+        // Step 1: Show the confirmation modal - MANDATORY, no bypass
+        setConfirmModal({
+            open: true,
+            type,
+            onConfirm: async () => {
+                // Step 2: Only run AFTER the user explicitly confirms
+                setConfirmModal({ open: false, type: null, onConfirm: null });
+                setLoading(true);
+                try {
+                    const endpoint = `/api/ai-brain/vectors/sync-${type}`;
+                    const res = await fetch(`http://localhost:3001${endpoint}`, { method: 'POST' });
+                    const data = await res.json();
+
+                    if (res.status === 409) {
+                        alert('⚠️ A vector sync is already running. Please wait for it to complete.');
+                        setLoading(false);
+                        return;
+                    }
+
+                    if (data.success) {
+                        setCurrentProcessId(data.id);
+                        setProcessModalOpen(true);
+                    } else {
+                        alert(`❌ Sync failed: ${data.error || 'Unknown error'}`);
+                    }
+                } catch (e) {
+                    alert(`${type} vector sync failed`);
+                }
+                setLoading(false);
             }
-        } catch (e) {
-            alert(`${type} vector sync failed`);
-        }
-        setLoading(false);
+        });
     };
 
-    const pendingVectors = products.filter(p => !p.embedding || p.embedding === 'null' || p.embedding === '[]').length;
+
+    const pendingVectors = pagination.pendingTotal || 0;
 
     return (
         <div className="h-[calc(100vh-40px)] flex flex-col gap-5 pb-[10px] overflow-hidden">
@@ -177,6 +296,16 @@ export default function AIBrainView() {
                     </h1>
                     <p className="text-gray-500">Manage business intelligence for the RAG Auto-Reply system.</p>
                 </div>
+                {discoveries > 0 && (
+                    <motion.div 
+                        initial={{ opacity: 0, scale: 0.8 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        className="bg-purple-100 border border-purple-200 text-purple-700 px-4 py-1.5 rounded-full text-sm font-medium flex items-center gap-2 shadow-sm animate-pulse"
+                    >
+                        <Sparkles size={14} />
+                        {discoveries} new intelligence findings
+                    </motion.div>
+                )}
                 <div className="flex gap-3">
                     <button
                         onClick={syncBrain}
@@ -192,7 +321,7 @@ export default function AIBrainView() {
                         className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-xl flex items-center gap-2 font-bold transition-all shadow-lg shadow-purple-200 active:scale-95"
                     >
                         <Zap size={18} className={loading && currentProcessId?.startsWith('vector_sync_products') ? 'animate-spin text-yellow-300' : 'text-yellow-300'} />
-                        Sync Products Brain
+                        Sync Products Brain ({pagination.total})
                         {pendingVectors > 0 && (
                             <span className="bg-white/20 px-1.5 py-0.5 rounded-md text-[10px] ml-1">{pendingVectors}</span>
                         )}
@@ -210,11 +339,16 @@ export default function AIBrainView() {
                     <Building2 size={18} /> Business Profile
                 </button>
                 <button
-                    onClick={() => { setActiveTab('products'); fetchProducts(); }}
+                    onClick={() => { setActiveTab('products'); fetchProducts(1); setDiscoveries(0); }}
                     className={`px-6 py-3 font-medium flex items-center gap-2 border-b-2 transition-colors ${activeTab === 'products' ? 'border-purple-600 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'
                         }`}
                 >
                     <PackageSearch size={18} /> AI Products
+                    {discoveries > 0 && (
+                        <span className="bg-purple-600 text-white text-[10px] px-1.5 py-0.5 rounded-full ml-1">
+                            {discoveries}
+                        </span>
+                    )}
                 </button>
                 <button
                     onClick={() => { setActiveTab('knowledge'); fetchKnowledge(); }}
@@ -223,13 +357,43 @@ export default function AIBrainView() {
                 >
                     <BookOpen size={18} /> Knowledge Base
                 </button>
+                <button
+                    onClick={() => { setActiveTab('analytics'); fetchAIAnalytics(); }}
+                    className={`px-6 py-3 font-medium flex items-center gap-2 border-b-2 transition-colors ${activeTab === 'analytics' ? 'border-purple-600 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'
+                        }`}
+                >
+                    <TrendingUp size={18} /> Performance
+                </button>
+                <button
+                    onClick={() => { setActiveTab('logs'); fetchAILogs(1); }}
+                    className={`px-6 py-3 font-medium flex items-center gap-2 border-b-2 transition-colors ${activeTab === 'logs' ? 'border-purple-600 text-purple-600' : 'border-transparent text-gray-500 hover:text-gray-700'
+                        }`}
+                >
+                    <HistoryIcon size={18} /> Audit Logs
+                </button>
             </div>
 
             {/* Content Area */}
-            <div className="flex-1 min-h-0 bg-white rounded-xl shadow-sm border border-gray-100 p-6 flex flex-col overflow-y-auto custom-scrollbar">
+            <div className={`flex-1 min-h-0 bg-white rounded-xl shadow-sm border border-gray-100 flex flex-col overflow-hidden ${activeTab !== 'products' ? 'p-6 overflow-y-auto custom-scrollbar' : 'p-0'}`}>
                 {activeTab === 'profile' && <ProfileTab profile={profile} fetchProfile={fetchProfile} syncVectors={syncVectors} />}
-                {activeTab === 'products' && <ProductsTab products={products} fetchProducts={fetchProducts} />}
+                {activeTab === 'products' && (
+                    <ProductsTab 
+                        products={products} 
+                        fetchProducts={fetchProducts} 
+                        pagination={pagination} 
+                        isFetchingMore={isFetchingMore}
+                    />
+                )}
                 {activeTab === 'knowledge' && <KnowledgeTab knowledge={knowledge} fetchKnowledge={fetchKnowledge} syncVectors={syncVectors} />}
+                {activeTab === 'analytics' && <AnalyticsTab stats={aiAnalytics} />}
+                {activeTab === 'logs' && (
+                    <LogsTab 
+                        logs={aiLogs} 
+                        pagination={logsPagination} 
+                        fetchLogs={fetchAILogs} 
+                        onSelect={setSelectedLog} 
+                    />
+                )}
             </div>
 
             <ProcessModal
@@ -242,6 +406,17 @@ export default function AIBrainView() {
                 id={currentProcessId || ''}
                 onClose={() => setProcessModalOpen(false)}
             />
+
+            {/* 🔒 VECTOR SYNC CONFIRMATION MODAL - Guards ALL vector sync actions */}
+            <VectorSyncConfirmModal
+                open={confirmModal.open}
+                type={confirmModal.type}
+                onConfirm={confirmModal.onConfirm!}
+                onCancel={() => setConfirmModal({ open: false, type: null, onConfirm: null })}
+            />
+
+            <LogDetailModal log={selectedLog} onClose={() => setSelectedLog(null)} />
+
         </div>
     );
 }
@@ -364,64 +539,104 @@ function ProfileTab({ profile, fetchProfile, syncVectors }: { profile: any, fetc
     );
 }
 
-function ProductsTab({ products, fetchProducts }: { products: any[], fetchProducts: () => void }) {
+function ProductsTab({ products, fetchProducts, pagination, isFetchingMore }: { products: any[], fetchProducts: (page?: number, search?: string) => void, pagination: any, isFetchingMore: boolean }) {
     const [adding, setAdding] = useState(false);
     const [selectedProduct, setSelectedProduct] = useState<any>(null);
-    const [formData, setFormData] = useState<any>({ name: '', price: '', description: '', product_url: '', full_description: '', sku: '', regular_price: '', sale_price: '' });
+    const [formData, setFormData] = useState<any>({
+        name: '', price: '', description: '', product_url: '',
+        full_description: '', sku: '', regular_price: '', sale_price: '',
+        composition: '', handling_guidelines: '', technical_attributes: ''
+    });
     const [searchQuery, setSearchQuery] = useState('');
     const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+    const [isAllSelectedGlobally, setIsAllSelectedGlobally] = useState(false);
+    
+    // V16.0 Virtualization: Ultra-low RAM DOM Rendering
+    const [scrollTop, setScrollTop] = useState(0);
+    const containerRef = React.useRef<HTMLDivElement>(null);
+    const rowHeight = 100; // Est. height per row
+    const viewportBuffer = 10; // Extra rows for smooth scroll
+    
+    const handleScroll = (e: React.UIEvent<HTMLDivElement>) => {
+        setScrollTop(e.currentTarget.scrollTop);
+    };
 
-    // Pagination State
-    const [currentPage, setCurrentPage] = useState(1);
-    const [itemsPerPage] = useState(20);
+    const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - viewportBuffer);
+    const visibleProducts = products.slice(startIndex, startIndex + 30); // Render window of 30
+    const topSpacer = startIndex * rowHeight;
+    const bottomSpacer = Math.max(0, (products.length - (startIndex + visibleProducts.length)) * rowHeight);
 
     const toggleSelectAll = () => {
-        if (selectedIds.size === products.length && products.length > 0) {
+        if (isAllSelectedGlobally) {
+            setIsAllSelectedGlobally(false);
             setSelectedIds(new Set());
+        } else if (selectedIds.size === products.length && products.length > 0) {
+            setSelectedIds(new Set());
+            setIsAllSelectedGlobally(false);
         } else {
-            setSelectedIds(new Set(filteredProducts.map(p => p.id)));
+            setSelectedIds(new Set(products.map(p => p.id)));
         }
     };
 
     const toggleSelect = (id: string) => {
         const next = new Set(selectedIds);
-        if (next.has(id)) next.delete(id);
-        else next.add(id);
+        if (next.has(id)) {
+            next.delete(id);
+            setIsAllSelectedGlobally(false); // Deselecting one breaks global select
+        } else {
+            next.add(id);
+        }
         setSelectedIds(next);
     };
 
     const bulkDelete = async () => {
-        if (selectedIds.size === 0) return;
-        if (!confirm(`Are you sure you want to delete ${selectedIds.size} products?`)) return;
+        if (selectedIds.size === 0 && !isAllSelectedGlobally) return;
+        
+        const count = isAllSelectedGlobally ? pagination.total : selectedIds.size;
+        if (!confirm(`Are you sure you want to delete ${count} products?`)) return;
 
         try {
+            const body: any = { selectionMode: isAllSelectedGlobally ? 'filter' : 'ids' };
+            if (isAllSelectedGlobally) {
+                body.filter = { search: searchQuery };
+            } else {
+                body.ids = Array.from(selectedIds);
+            }
+
             const res = await fetch('http://localhost:3001/api/ai-brain/products/bulk-delete', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ids: Array.from(selectedIds) })
+                body: JSON.stringify(body)
             });
             if (res.ok) {
                 setSelectedIds(new Set());
-                fetchProducts();
+                setIsAllSelectedGlobally(false);
+                fetchProducts(1, searchQuery);
             }
         } catch (e) { alert('Bulk delete failed'); }
     };
 
-    const filteredProducts = products.filter(p =>
-        p.name?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        p.description?.toLowerCase().includes(searchQuery.toLowerCase())
-    );
-
-    // Pagination Logic
-    const totalPages = Math.ceil(filteredProducts.length / itemsPerPage);
-    const paginatedProducts = filteredProducts.slice(
-        (currentPage - 1) * itemsPerPage,
-        currentPage * itemsPerPage
-    );
-
+    // Server-side search debouncing
     useEffect(() => {
-        setCurrentPage(1);
+        const timer = setTimeout(() => {
+            fetchProducts(1, searchQuery);
+            setIsAllSelectedGlobally(false); // Reset global select on search change
+        }, 500);
+        return () => clearTimeout(timer);
     }, [searchQuery]);
+
+    // Infinite Scroll Implementation
+    const observer = React.useRef<IntersectionObserver | null>(null);
+    const lastElementRef = React.useCallback((node: any) => {
+        if (isFetchingMore) return;
+        if (observer.current) observer.current.disconnect();
+        observer.current = new IntersectionObserver(entries => {
+            if (entries[0].isIntersecting && pagination.page < pagination.totalPages) {
+                fetchProducts(pagination.page + 1, searchQuery);
+            }
+        });
+        if (node) observer.current.observe(node);
+    }, [isFetchingMore, pagination, searchQuery, fetchProducts]);
 
     const addProduct = async () => {
         try {
@@ -430,9 +645,13 @@ function ProductsTab({ products, fetchProducts }: { products: any[], fetchProduc
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(formData)
             });
-            fetchProducts();
+            fetchProducts(1);
             setAdding(false);
-            setFormData({ name: '', price: '', description: '', product_url: '', full_description: '', sku: '', regular_price: '', sale_price: '' });
+            setFormData({
+                name: '', price: '', description: '', product_url: '',
+                full_description: '', sku: '', regular_price: '', sale_price: '',
+                composition: '', handling_guidelines: '', technical_attributes: ''
+            });
         } catch (e) { alert('Failed to add product'); }
     };
 
@@ -440,16 +659,16 @@ function ProductsTab({ products, fetchProducts }: { products: any[], fetchProduc
         if (!confirm('Are you sure?')) return;
         try {
             await fetch(`http://localhost:3001/api/ai-brain/products/${id}`, { method: 'DELETE' });
-            fetchProducts();
+            fetchProducts(1);
         } catch (e) { alert('Failed to delete'); }
     };
 
     return (
-        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex flex-col gap-6">
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex flex-col gap-6 p-6 h-full min-h-0">
             <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 mb-8">
                 <div>
                     <h2 className="text-2xl font-black text-gray-900 tracking-tight">Product Catalog</h2>
-                    <p className="text-sm text-gray-500 font-medium">Manage and monitor {products.length} intelligence nodes.</p>
+                    <p className="text-sm text-gray-500 font-medium">Manage and monitor {pagination.total} intelligence nodes.</p>
                 </div>
                 <div className="flex gap-3 w-full md:w-auto">
                     <div className="relative flex-1 md:w-64">
@@ -467,7 +686,7 @@ function ProductsTab({ products, fetchProducts }: { products: any[], fetchProduc
                             onClick={bulkDelete}
                             className="bg-rose-50 hover:bg-rose-100 text-rose-600 px-5 py-2.5 rounded-2xl flex items-center gap-2 font-bold text-sm transition-all border border-rose-100"
                         >
-                            <Trash2 size={18} /> Delete {selectedIds.size}
+                            <Trash2 size={18} /> Delete {isAllSelectedGlobally ? pagination.total : selectedIds.size}
                         </button>
                     )}
                     <button onClick={() => setAdding(!adding)} className="bg-gray-900 hover:bg-black text-white px-5 py-2.5 rounded-2xl flex items-center gap-2 font-bold text-sm shadow-lg shadow-gray-200 transition-all active:scale-95">
@@ -508,8 +727,20 @@ function ProductsTab({ products, fetchProducts }: { products: any[], fetchProduc
                             <textarea placeholder="Write a short summary..." value={formData.description} onChange={e => setFormData({ ...formData, description: e.target.value })} className="w-full p-3 bg-white border border-purple-100 rounded-2xl text-sm font-medium focus:ring-2 focus:ring-purple-200 outline-none" rows={2} />
                         </div>
                         <div className="col-span-2">
-                            <label className="text-[10px] font-black text-purple-400 uppercase tracking-widest mb-1.5 block">Full Technical Specs</label>
-                            <textarea placeholder="Paste detailed descriptions or variants here..." value={formData.full_description || ''} onChange={e => setFormData({ ...formData, full_description: e.target.value })} className="w-full p-3 bg-white border border-purple-100 rounded-2xl text-sm font-medium focus:ring-2 focus:ring-purple-200 outline-none" rows={3} />
+                            <label className="text-[10px] font-black text-purple-400 uppercase tracking-widest mb-1.5 block">Full Description (SEO Rich Content)</label>
+                            <textarea placeholder="Paste detailed descriptions or rich content here..." value={formData.full_description || ''} onChange={e => setFormData({ ...formData, full_description: e.target.value })} className="w-full p-3 bg-white border border-purple-100 rounded-2xl text-sm font-medium focus:ring-2 focus:ring-purple-200 outline-none" rows={3} />
+                        </div>
+                        <div className="col-span-1">
+                            <label className="text-[10px] font-black text-purple-400 uppercase tracking-widest mb-1.5 block">Composition (Fabric/Ingredients)</label>
+                            <input type="text" placeholder="e.g. 100% Cotton" value={formData.composition || ''} onChange={e => setFormData({ ...formData, composition: e.target.value })} className="w-full p-3 bg-white border border-purple-100 rounded-2xl text-sm font-bold focus:ring-2 focus:ring-purple-200 outline-none" />
+                        </div>
+                        <div className="col-span-1">
+                            <label className="text-[10px] font-black text-purple-400 uppercase tracking-widest mb-1.5 block">Handling (Care/Usage)</label>
+                            <input type="text" placeholder="e.g. Hand Wash Only" value={formData.handling_guidelines || ''} onChange={e => setFormData({ ...formData, handling_guidelines: e.target.value })} className="w-full p-3 bg-white border border-purple-100 rounded-2xl text-sm font-bold focus:ring-2 focus:ring-purple-200 outline-none" />
+                        </div>
+                        <div className="col-span-2">
+                            <label className="text-[10px] font-black text-purple-400 uppercase tracking-widest mb-1.5 block">Technical Attributes (Fit/Dims/Specs)</label>
+                            <textarea placeholder="Fit: Slim | Stretch: Low | Weight: 250g" value={formData.technical_attributes || ''} onChange={e => setFormData({ ...formData, technical_attributes: e.target.value })} className="w-full p-3 bg-white border border-purple-100 rounded-2xl text-sm font-medium focus:ring-2 focus:ring-purple-200 outline-none" rows={2} />
                         </div>
                         <div className="col-span-2 flex gap-3 pt-2">
                             <button onClick={addProduct} className="flex-1 bg-purple-600 hover:bg-purple-700 text-white py-3 rounded-2xl font-black text-xs uppercase tracking-[0.2em] shadow-lg shadow-purple-100 transition-all">Save Intelligence Node</button>
@@ -519,44 +750,90 @@ function ProductsTab({ products, fetchProducts }: { products: any[], fetchProduc
                 </motion.div>
             )}
 
-            <div className="bg-white rounded-[2.5rem] border border-gray-100 shadow-sm overflow-hidden">
-                <div className="overflow-x-auto custom-scrollbar">
-                    <table className="w-full text-left border-collapse min-w-[800px] relative">
-                        <thead className="bg-gray-50/50">
+            {/* 
+              Enterprise-grade responsive table:
+              - table-fixed: columns share space, no overflow bleed
+              - w-full: fills entire container, no min-width hard-code
+              - column widths in % → fully dynamic to viewport
+              - All text content uses truncate so no cell can expand past its column
+            */}
+            <div className="bg-white rounded-[2.5rem] border border-gray-100 shadow-sm overflow-hidden flex flex-col flex-1 min-h-0">
+                {/* Selection Banner */}
+                {selectedIds.size === products.length && products.length > 0 && pagination.total > products.length && (
+                    <div className="bg-purple-600 text-white px-8 py-2 text-[11px] font-bold flex items-center justify-center gap-4 transition-all animate-in slide-in-from-top">
+                        <span>{isAllSelectedGlobally ? `All ${pagination.total} products in the brain are selected.` : `All ${products.length} products on this page are selected.`}</span>
+                        {!isAllSelectedGlobally ? (
+                            <button 
+                                onClick={() => setIsAllSelectedGlobally(true)}
+                                className="underline hover:text-yellow-300 transition-colors"
+                            >
+                                Select all {pagination.total} products in the brain
+                            </button>
+                        ) : (
+                            <button 
+                                onClick={() => setIsAllSelectedGlobally(false)}
+                                className="underline hover:text-yellow-300 transition-colors"
+                            >
+                                Clear selection
+                            </button>
+                        )}
+                    </div>
+                )}
+                <div 
+                    ref={containerRef}
+                    onScroll={handleScroll}
+                    className="overflow-x-hidden overflow-y-auto custom-scrollbar flex-1 min-h-0"
+                >
+                    <table className="w-full text-left border-collapse table-fixed">
+                        <colgroup>
+                            {/* Checkbox */}
+                            <col style={{ width: '44px' }} />
+                            {/* Name + variants — takes the bulk of space */}
+                            <col style={{ width: '42%' }} />
+                            {/* Price */}
+                            <col style={{ width: '15%' }} />
+                            {/* Origin */}
+                            <col style={{ width: '13%' }} />
+                            {/* Brain Status */}
+                            <col style={{ width: '15%' }} />
+                            {/* Actions */}
+                            <col style={{ width: '80px' }} />
+                        </colgroup>
+                        <thead className="bg-gray-50/50 sticky top-0 z-10 backdrop-blur-md">
                             <tr>
-                                <th className="p-6 w-12">
+                                <th className="px-3 py-4">
                                     <input
                                         type="checkbox"
                                         checked={selectedIds.size === products.length && products.length > 0}
                                         onChange={toggleSelectAll}
-                                        className="w-4 h-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500 transition-all cursor-pointer"
+                                        className="w-4 h-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500 cursor-pointer"
                                     />
                                 </th>
-                                <th className="p-6 text-[10px] font-black text-gray-400 uppercase tracking-widest text-left">
+                                <th className="px-3 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-left">
                                     <div className="flex items-center gap-2">
-                                        <Tag size={12} className="text-purple-400" /> Intelligence Node
+                                        <Tag size={12} className="text-purple-400 flex-shrink-0" /> Intelligence Node
                                     </div>
                                 </th>
-                                <th className="p-6 text-[10px] font-black text-gray-400 uppercase tracking-widest text-left w-32">
+                                <th className="px-3 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-left">
                                     <div className="flex items-center gap-2">
-                                        <TrendingUp size={12} className="text-emerald-400" /> Valuation
+                                        <TrendingUp size={12} className="text-emerald-400 flex-shrink-0" /> Valuation
                                     </div>
                                 </th>
-                                <th className="p-6 text-[10px] font-black text-gray-400 uppercase tracking-widest text-left w-32">
+                                <th className="px-3 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-left">
                                     <div className="flex items-center gap-2">
-                                        <Cpu size={12} className="text-indigo-400" /> Origin
+                                        <Cpu size={12} className="text-indigo-400 flex-shrink-0" /> Origin
                                     </div>
                                 </th>
-                                <th className="p-6 text-[10px] font-black text-gray-400 uppercase tracking-widest text-left w-32">
+                                <th className="px-3 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-left">
                                     <div className="flex items-center gap-2">
-                                        <Activity size={12} className="text-amber-400" /> Status
+                                        <Activity size={12} className="text-amber-400 flex-shrink-0" /> Status
                                     </div>
                                 </th>
-                                <th className="p-6 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right w-24">Actions</th>
+                                <th className="px-3 py-4 text-[10px] font-black text-gray-400 uppercase tracking-widest text-right">Act</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-gray-50">
-                            {filteredProducts.length === 0 ? (
+                            {products.length === 0 ? (
                                 <tr>
                                     <td colSpan={6} className="p-20 text-center">
                                         <div className="flex flex-col items-center gap-3 opacity-20">
@@ -565,175 +842,160 @@ function ProductsTab({ products, fetchProducts }: { products: any[], fetchProduc
                                         </div>
                                     </td>
                                 </tr>
-                            ) : paginatedProducts.map((p, i) => (
-                                <motion.tr
-                                    key={p.id || i}
-                                    initial={{ opacity: 0, y: 10 }}
-                                    animate={{ opacity: 1, y: 0 }}
-                                    transition={{ delay: i * 0.05 }}
-                                    onClick={() => setSelectedProduct(p)}
-                                    className={`group hover:bg-purple-50/40 transition-all cursor-pointer border-b border-gray-50/80 last:border-0 relative ${selectedIds.has(p.id) ? 'bg-purple-50/20 active-row' : ''}`}
-                                >
-                                    <td className="p-6" onClick={e => e.stopPropagation()}>
-                                        <input
-                                            type="checkbox"
-                                            checked={selectedIds.has(p.id)}
-                                            onChange={() => toggleSelect(p.id)}
-                                            className="w-4 h-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500 transition-all cursor-pointer"
-                                        />
-                                    </td>
-                                    <td className="p-6">
-                                        <div className="flex items-center gap-5">
-                                            <div className="w-16 h-16 bg-white rounded-[1.25rem] flex items-center justify-center overflow-hidden border-2 border-gray-100 flex-shrink-0 shadow-sm group-hover:border-purple-200 group-hover:shadow-md transition-all duration-300">
-                                                {p.image_url ? (
-                                                    <img src={p.image_url} alt="" className="w-full h-full object-cover group-hover:scale-110 transition-transform duration-700" />
-                                                ) : (
-                                                    <PackageSearch className="text-gray-200" size={28} />
-                                                )}
-                                            </div>
-                                            <div className="min-w-0">
-                                                <div className="font-extrabold text-gray-900 group-hover:text-purple-700 transition-colors truncate max-w-[240px] text-base mb-0.5">{p.name}</div>
-                                                <div className="text-[10px] text-gray-400 font-bold truncate max-w-sm">{p.description || 'No specialized description...'}</div>
-                                                <div className="flex items-center gap-3 mt-2.5">
-                                                    {p.product_url && (
-                                                        <div className="inline-flex items-center gap-1.5 text-[9px] font-black text-gray-300 group-hover:text-purple-400 uppercase transition-colors">
-                                                            <Globe size={10} /> {new URL(p.product_url).hostname}
-                                                        </div>
-                                                    )}
-                                                    <div className="w-1 h-1 rounded-full bg-gray-200" />
-                                                    <div className="text-[9px] font-black text-gray-300 uppercase tracking-tighter">ID: {String(p.id).slice(-6)}</div>
-                                                </div>
-                                            </div>
-                                        </div>
-                                        {(() => {
-                                            const raw = p.variants;
-                                            let items = [];
-                                            try {
-                                                const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
-                                                items = (parsed?.items || (Array.isArray(parsed) ? parsed : []));
-                                            } catch (e) { items = []; }
-
-                                            if (items.length === 0) return null;
-
-                                            return (
-                                                <div className="flex flex-wrap gap-1.5 mt-4 ml-21">
-                                                    {items.slice(0, 3).map((v: any, vi: number) => (
-                                                        <span key={vi} className="px-2.5 py-1 bg-white text-[9px] font-black text-purple-600 rounded-lg border border-purple-100/50 uppercase tracking-tighter shadow-sm whitespace-nowrap group-hover:border-purple-200 transition-colors">
-                                                            {v.type || v.name}: {v.value || v.sku}
-                                                        </span>
-                                                    ))}
-                                                    {items.length > 3 && (
-                                                        <span className="px-2 py-1 bg-gray-50 text-[9px] font-black text-gray-400 rounded-lg border border-gray-100 uppercase tracking-tighter whitespace-nowrap">
-                                                            +{items.length - 3} MORE
-                                                        </span>
-                                                    )}
-                                                </div>
-                                            );
-                                        })()}
-                                    </td>
-                                    <td className="p-6">
-                                        <div className="flex flex-col gap-1">
-                                            {p.regular_price && p.sale_price ? (
-                                                <>
-                                                    <div className="text-[10px] font-bold text-gray-400 line-through leading-none">{p.regular_price}</div>
-                                                    <div className="flex items-center gap-1.5">
-                                                        <div className="text-lg font-black text-emerald-600 tracking-tight leading-none">{p.sale_price}</div>
-                                                        <div className="px-1.5 py-0.5 bg-emerald-50 text-emerald-600 text-[8px] font-black rounded-md uppercase tracking-tighter border border-emerald-100/50">OFFER</div>
+                            ) : (
+                                <>
+                                    {topSpacer > 0 && <tr><td colSpan={6} style={{ height: topSpacer }} /></tr>}
+                                    {visibleProducts.map((p, i) => (
+                                        <tr
+                                            key={p.id || (startIndex + i)}
+                                            onClick={() => setSelectedProduct(p)}
+                                            className={`group hover:bg-purple-50/40 transition-all cursor-pointer border-b border-gray-50/80 last:border-0 ${selectedIds.has(p.id) ? 'bg-purple-50/20' : ''}`}
+                                        >
+                                            {/* Checkbox */}
+                                            <td className="px-3 py-3" onClick={e => e.stopPropagation()}>
+                                                <input
+                                                    type="checkbox"
+                                                    checked={selectedIds.has(p.id)}
+                                                    onChange={() => toggleSelect(p.id)}
+                                                    className="w-4 h-4 rounded border-gray-300 text-purple-600 focus:ring-purple-500 cursor-pointer"
+                                                />
+                                            </td>
+        
+                                            {/* Name + Description + Variants */}
+                                            <td className="px-3 py-3 overflow-hidden">
+                                                <div className="flex items-center gap-3 min-w-0">
+                                                    {/* Product thumbnail */}
+                                                    <div className="w-12 h-12 bg-white rounded-xl flex items-center justify-center overflow-hidden border-2 border-gray-100 flex-shrink-0 shadow-sm group-hover:border-purple-200 transition-all duration-200">
+                                                        {p.image_url ? (
+                                                            <img loading="lazy" src={p.image_url} alt="" className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500" />
+                                                        ) : (
+                                                            <PackageSearch className="text-gray-200" size={22} />
+                                                        )}
                                                     </div>
-                                                </>
-                                            ) : (
-                                                <div className="text-lg font-black text-gray-900 tracking-tight">{p.price || 'N/A'}</div>
-                                            )}
-                                            <div className="text-[9px] font-black text-gray-400 uppercase tracking-widest mt-0.5">EST. VALUE</div>
-                                        </div>
-                                    </td>
-                                    <td className="p-6">
-                                        <div className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-widest shadow-sm transition-all ${p.manual_override ? 'bg-indigo-50/80 text-indigo-600 border border-indigo-100' : 'bg-emerald-50/80 text-emerald-600 border border-emerald-100'}`}>
-                                            {p.manual_override ? <Edit2 size={11} /> : <Zap size={11} />}
-                                            {p.manual_override ? 'Manual' : 'System'}
-                                        </div>
-                                    </td>
-                                    <td className="p-6">
-                                        <div className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-widest shadow-sm transition-all ${p.embedding && p.embedding.length > 10 ? 'bg-wa-teal/10 text-wa-teal border border-wa-teal/20' : 'bg-amber-50/80 text-amber-600 border border-amber-100'}`}>
+                                                    {/* Text content - MUST stay within column */}
+                                                    <div className="min-w-0 flex-1">
+                                                        <div className="font-extrabold text-gray-900 group-hover:text-purple-700 transition-colors truncate text-sm mb-0.5">{p.name}</div>
+                                                        <div className="text-[10px] text-gray-400 font-medium truncate">{p.description || 'No description...'}</div>
+                                                        {/* Inline variant badges */}
+                                                        {(() => {
+                                                            const raw = p.variants;
+                                                            let items: any[] = [];
+                                                            try {
+                                                                const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                                                                items = parsed?.items || (Array.isArray(parsed) ? parsed : []);
+                                                            } catch { items = []; }
+                                                            if (items.length === 0) return null;
+                                                            return (
+                                                                <div className="flex flex-wrap gap-1 mt-1.5">
+                                                                    {items.slice(0, 3).map((v: any, vi: number) => (
+                                                                        <span key={vi} className="px-2 py-0.5 bg-purple-50 text-[9px] font-black text-purple-600 rounded-md border border-purple-100/60 uppercase tracking-tighter whitespace-nowrap">
+                                                                            {v.type || v.name}: {v.value || v.sku}
+                                                                        </span>
+                                                                    ))}
+                                                                    {items.length > 3 && (
+                                                                        <span className="px-2 py-0.5 bg-gray-50 text-[9px] font-black text-gray-400 rounded-md border border-gray-100 uppercase tracking-tighter whitespace-nowrap">
+                                                                            +{items.length - 3}
+                                                                        </span>
+                                                                    )}
+                                                                </div>
+                                                            );
+                                                        })()}
+                                                        {/* Domain + ID row */}
+                                                        <div className="flex items-center gap-2 mt-1">
+                                                            {p.product_url && (
+                                                                <div className="inline-flex items-center gap-1 text-[9px] font-bold text-gray-300 group-hover:text-purple-400 uppercase transition-colors truncate max-w-[120px]">
+                                                                    <Globe size={9} />
+                                                                    <span className="truncate">{(() => { try { return new URL(p.product_url).hostname; } catch { return ''; } })()}</span>
+                                                                </div>
+                                                            )}
+                                                            <div className="text-[9px] font-bold text-gray-300 uppercase tracking-tighter flex-shrink-0">#{String(p.id).slice(-6)}</div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </td>
+        
+                                            {/* Price */}
+                                            <td className="px-3 py-3 overflow-hidden">
+                                                <div className="flex flex-col gap-0.5">
+                                                    {p.regular_price && p.sale_price ? (
+                                                        <>
+                                                            <div className="text-[10px] font-bold text-gray-400 line-through leading-none truncate">{p.regular_price}</div>
+                                                            <div className="flex items-center gap-1 flex-wrap">
+                                                                <div className="text-base font-black text-emerald-600 tracking-tight leading-none truncate">{p.sale_price}</div>
+                                                                <div className="px-1.5 py-0.5 bg-emerald-50 text-emerald-600 text-[8px] font-black rounded border border-emerald-100/50 flex-shrink-0">OFFER</div>
+                                                            </div>
+                                                        </>
+                                                    ) : (
+                                                        <div className="text-base font-black text-gray-900 tracking-tight truncate">{p.price || 'N/A'}</div>
+                                                    )}
+                                                    <div className="text-[9px] font-black text-gray-400 uppercase tracking-widest mt-0.5">Price</div>
+                                                </div>
+                                            </td>
+        
+                                            {/* Origin */}
+                                            <td className="px-3 py-3 overflow-hidden">
+                                                <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[9px] font-black uppercase tracking-widest max-w-full ${p.manual_override ? 'bg-indigo-50/80 text-indigo-600 border border-indigo-100' : 'bg-emerald-50/80 text-emerald-600 border border-emerald-100'}`}>
+                                                    {p.manual_override ? <Edit2 size={10} /> : <Zap size={10} />}
+                                                    <span className="truncate">{p.manual_override ? 'Manual' : 'System'}</span>
+                                                </div>
+                                            </td>
+
+                                    {/* Brain Status */}
+                                    <td className="px-3 py-3 overflow-hidden">
+                                        <div className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[9px] font-black uppercase tracking-widest max-w-full ${p.embedding && p.embedding.length > 10 ? 'bg-teal-50 text-teal-600 border border-teal-100' : 'bg-amber-50/80 text-amber-600 border border-amber-100'}`}>
                                             {p.embedding && p.embedding.length > 10 ? (
-                                                <>
-                                                    <CheckCircle2 size={11} />
-                                                    <span>Brain Ready</span>
-                                                </>
+                                                <><CheckCircle2 size={10} /><span className="truncate">Ready</span></>
                                             ) : (
-                                                <>
-                                                    <Activity size={11} className="animate-pulse" />
-                                                    <span>Syncing...</span>
-                                                </>
+                                                <><Activity size={10} className="animate-pulse" /><span className="truncate">Pending</span></>
                                             )}
                                         </div>
                                     </td>
-                                    <td className="p-6 text-right">
-                                        <div className="flex justify-end items-center gap-4">
+
+                                    {/* Actions */}
+                                    <td className="px-3 py-3 text-right">
+                                        <div className="flex justify-end items-center gap-2">
                                             <button
                                                 onClick={(e) => { e.stopPropagation(); deleteProduct(p.id); }}
-                                                className="p-2.5 text-gray-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all shadow-sm hover:shadow-md"
-                                                title="Remove Node"
+                                                className="p-2 text-gray-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all"
+                                                title="Remove"
                                             >
-                                                <Trash2 size={16} />
+                                                <Trash2 size={15} />
                                             </button>
-                                            <div className="w-10 h-10 rounded-xl bg-gray-50 flex items-center justify-center text-gray-300 group-hover:bg-purple-600 group-hover:text-white group-hover:shadow-lg group-hover:shadow-purple-200 transition-all duration-300">
-                                                <ChevronRight size={20} className="group-hover:translate-x-0.5 transition-transform" />
+                                            <div className="w-8 h-8 rounded-xl bg-gray-50 flex items-center justify-center text-gray-300 group-hover:bg-purple-600 group-hover:text-white group-hover:shadow-md group-hover:shadow-purple-200 transition-all duration-300">
+                                                <ChevronRight size={16} className="group-hover:translate-x-0.5 transition-transform" />
                                             </div>
                                         </div>
                                     </td>
-                                </motion.tr>
-                            ))}
+                                        </tr>
+                                    ))}
+                                    {bottomSpacer > 0 && <tr><td colSpan={6} style={{ height: bottomSpacer }} /></tr>}
+                                    {/* Infinite Scroll Sentinel */}
+                                    {!isFetchingMore && pagination.page < pagination.totalPages && (
+                                        <tr ref={lastElementRef}>
+                                            <td colSpan={6} className="py-4 text-center">
+                                                <div className="flex items-center justify-center gap-2 text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] animate-pulse">
+                                                    <RefreshCw size={12} className="animate-spin" />
+                                                    Syncing more nodes...
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    )}
+                                </>
+                            )}
                         </tbody>
                     </table>
                 </div>
 
-                {/* Pagination Footer */}
-                <div className="px-8 py-5 bg-gray-50/50 border-t border-gray-100 flex items-center justify-between">
+                {/* Loading Footer */}
+                <div className="px-8 py-4 bg-white/80 border-t border-gray-50 flex items-center justify-between sticky bottom-0 z-10 backdrop-blur-md">
                     <div className="text-[10px] font-black text-gray-400 uppercase tracking-widest">
-                        Showing <span className="text-purple-600">{(currentPage - 1) * itemsPerPage + 1}</span> to <span className="text-purple-600">{Math.min(currentPage * itemsPerPage, filteredProducts.length)}</span> of <span className="text-gray-900">{filteredProducts.length}</span> nodes
+                        Showing <span className="text-purple-600">{products.length}</span> of <span className="text-gray-900">{pagination.total}</span> nodes
                     </div>
-
-                    <div className="flex items-center gap-2">
-                        <button
-                            onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
-                            disabled={currentPage === 1}
-                            className={`p-2 rounded-xl transition-all ${currentPage === 1 ? 'text-gray-300' : 'text-gray-600 hover:bg-white hover:shadow-sm hover:text-purple-600 active:scale-95'}`}
-                        >
-                            <ChevronLeft size={18} />
-                        </button>
-
-                        <div className="flex items-center gap-1">
-                            {[...Array(totalPages)].map((_, idx) => {
-                                const pageNum = idx + 1;
-                                // Basic sliding window for many pages
-                                if (totalPages > 7) {
-                                    if (pageNum !== 1 && pageNum !== totalPages && Math.abs(pageNum - currentPage) > 1) {
-                                        if (pageNum === 2 || pageNum === totalPages - 1) return <span key={idx} className="text-gray-300 text-xs px-1">...</span>;
-                                        return null;
-                                    }
-                                }
-
-                                return (
-                                    <button
-                                        key={idx}
-                                        onClick={() => setCurrentPage(pageNum)}
-                                        className={`w-8 h-8 rounded-xl text-[10px] font-black transition-all ${currentPage === pageNum ? 'bg-purple-600 text-white shadow-lg shadow-purple-200' : 'text-gray-400 hover:bg-white hover:text-purple-600 shadow-sm border border-transparent hover:border-purple-100'}`}
-                                    >
-                                        {pageNum}
-                                    </button>
-                                );
-                            })}
+                    {isFetchingMore && (
+                        <div className="flex items-center gap-2 text-purple-600 font-bold text-[10px] uppercase tracking-widest">
+                            <RefreshCw size={14} className="animate-spin" /> Fetching More Intelligence...
                         </div>
-
-                        <button
-                            onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
-                            disabled={currentPage === totalPages || totalPages === 0}
-                            className={`p-2 rounded-xl transition-all ${currentPage === totalPages || totalPages === 0 ? 'text-gray-300' : 'text-gray-600 hover:bg-white hover:shadow-sm hover:text-purple-600 active:scale-95'}`}
-                        >
-                            <ChevronRight size={18} />
-                        </button>
-                    </div>
+                    )}
                 </div>
             </div>
 
@@ -820,6 +1082,48 @@ function ProductsTab({ products, fetchProducts }: { products: any[], fetchProduc
                                             </div>
                                             <p className="text-gray-600 leading-relaxed font-medium whitespace-pre-wrap">
                                                 {selectedProduct.description}
+                                            </p>
+                                        </div>
+                                    )}
+
+                                    {(selectedProduct.composition || selectedProduct.materials) && (
+                                        <div className="mb-8">
+                                            <div className="flex items-center gap-2 mb-4">
+                                                <div className="w-8 h-8 rounded-xl bg-emerald-50 flex items-center justify-center text-emerald-600">
+                                                    <Activity size={16} />
+                                                </div>
+                                                <h4 className="text-xs font-black text-gray-400 uppercase tracking-widest">Composition & Materials</h4>
+                                            </div>
+                                            <p className="text-gray-600 leading-relaxed font-medium">
+                                                {selectedProduct.composition || selectedProduct.materials}
+                                            </p>
+                                        </div>
+                                    )}
+
+                                    {(selectedProduct.handling_guidelines || selectedProduct.wash_instructions) && (
+                                        <div className="mb-8">
+                                            <div className="flex items-center gap-2 mb-4">
+                                                <div className="w-8 h-8 rounded-xl bg-blue-50 flex items-center justify-center text-blue-600">
+                                                    <Globe size={16} />
+                                                </div>
+                                                <h4 className="text-xs font-black text-gray-400 uppercase tracking-widest">Handling & Care Guidelines</h4>
+                                            </div>
+                                            <p className="text-gray-600 leading-relaxed font-medium">
+                                                {selectedProduct.handling_guidelines || selectedProduct.wash_instructions}
+                                            </p>
+                                        </div>
+                                    )}
+
+                                    {selectedProduct.technical_attributes && (
+                                        <div className="mb-8">
+                                            <div className="flex items-center gap-2 mb-4">
+                                                <div className="w-8 h-8 rounded-xl bg-indigo-50 flex items-center justify-center text-indigo-600">
+                                                    <Cpu size={16} />
+                                                </div>
+                                                <h4 className="text-xs font-black text-gray-400 uppercase tracking-widest">Technical Attributes</h4>
+                                            </div>
+                                            <p className="text-gray-600 leading-relaxed font-medium whitespace-pre-wrap">
+                                                {selectedProduct.technical_attributes}
                                             </p>
                                         </div>
                                     )}
@@ -1068,5 +1372,250 @@ function KnowledgeTab({ knowledge, fetchKnowledge, syncVectors }: { knowledge: a
                 ))}
             </div>
         </motion.div>
+    );
+}
+
+// ============================================================
+// 🔒 VECTOR SYNC CONFIRMATION MODAL
+// This modal MUST appear before ANY vector sync action.
+// ============================================================
+const VECTOR_SYNC_CONFIG: Record<string, { title: string; desc: string; icon: string; color: string; btnCls: string; gradCls: string; badgeCls: string; labelCls: string }> = {
+    products: {
+        title: 'Product Brain Sync',
+        desc: 'সমস্ত প্রোডাক্টের AI embeddings পুনরায় তৈরি হবে Gemini API দিয়ে। এটি আপনার প্রোডাক্টগুলোকে AI-এর জন্য আরও বুদ্ধিমান করে তুলবে।',
+        icon: '📦',
+        color: 'purple',
+        btnCls: 'bg-purple-600 hover:bg-purple-700 shadow-lg shadow-purple-200',
+        gradCls: 'from-purple-600 to-violet-600',
+        badgeCls: 'bg-purple-50 text-purple-600 border-purple-100',
+        labelCls: 'text-purple-500',
+    },
+    profile: {
+        title: 'Profile Brain Sync',
+        desc: 'Business Profile-এর AI embedding পুনরায় তৈরি হবে Gemini API দিয়ে। এটি চ্যাটবটকে আপনার বিজনেস সম্পর্কে জানতে সাহায্য করবে।',
+        icon: '🏢',
+        color: 'blue',
+        btnCls: 'bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-200',
+        gradCls: 'from-blue-600 to-cyan-600',
+        badgeCls: 'bg-blue-50 text-blue-600 border-blue-100',
+        labelCls: 'text-blue-500',
+    },
+    knowledge: {
+        title: 'Knowledge Brain Sync',
+        desc: 'সমস্ত Knowledge Base documents-এর AI embeddings পুনরায় তৈরি হবে Gemini API দিয়ে। এটি আপনার নলেজ বেসকে AI-এর জন্য প্রস্তুত করবে।',
+        icon: '📖',
+        color: 'emerald',
+        btnCls: 'bg-emerald-600 hover:bg-emerald-700 shadow-lg shadow-emerald-200',
+        gradCls: 'from-emerald-600 to-teal-600',
+        badgeCls: 'bg-emerald-50 text-emerald-600 border-emerald-100',
+        labelCls: 'text-emerald-500',
+    },
+    scraper: {
+        title: 'AI Brain Scraper Sync',
+        desc: 'ওয়েবসাইট crawl করে নতুন প্রোডাক্ট সংগ্রহ হবে এবং AI Brain-এ সংরক্ষণ হবে। এটি কেবল নতুন ডেটা আপডেট করবে, কোনো ভেক্টর প্রসেসিং হবে না।',
+        icon: '🕷️',
+        color: 'indigo',
+        btnCls: 'bg-indigo-600 hover:bg-indigo-700 shadow-lg shadow-indigo-200',
+        gradCls: 'from-indigo-600 to-purple-600',
+        badgeCls: 'bg-indigo-50 text-indigo-600 border-indigo-100',
+        labelCls: 'text-indigo-500',
+    },
+};
+
+function VectorSyncConfirmModal({
+    open,
+    type,
+    onConfirm,
+    onCancel,
+}: {
+    open: boolean;
+    type: 'products' | 'profile' | 'knowledge' | null;
+    onConfirm: () => void;
+    onCancel: () => void;
+}) {
+    if (!open) return null;
+
+    const cfg = VECTOR_SYNC_CONFIG[type || 'scraper'] || VECTOR_SYNC_CONFIG.products;
+
+    return (
+        <div
+            className="fixed inset-0 z-[9999] flex items-center justify-center"
+            style={{ backgroundColor: 'rgba(15,15,30,0.6)', backdropFilter: 'blur(8px)' }}
+            onClick={onCancel}
+        >
+            <motion.div
+                initial={{ opacity: 0, scale: 0.85, y: 32 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.85, y: 32 }}
+                transition={{ type: 'spring', stiffness: 360, damping: 28 }}
+                className="bg-white w-full max-w-[420px] mx-4 rounded-[2rem] overflow-hidden shadow-2xl"
+                onClick={e => e.stopPropagation()}
+            >
+                {/* Gradient top bar */}
+                <div className={`h-1.5 bg-gradient-to-r ${cfg.gradCls}`} />
+
+                <div className="p-8">
+                    {/* Header row */}
+                    <div className="flex items-start gap-4 mb-6">
+                        <div className={`w-14 h-14 rounded-2xl border ${cfg.badgeCls} flex items-center justify-center text-[2rem] flex-shrink-0`}>
+                            {cfg.icon}
+                        </div>
+                        <div className="pt-1">
+                            <p className={`text-[9px] font-black uppercase tracking-[0.18em] mb-0.5 ${cfg.labelCls}`}>
+                                ⚡ Confirmation Required
+                            </p>
+                            <h2 className="text-lg font-black text-gray-900 leading-snug">{cfg.title}</h2>
+                        </div>
+                    </div>
+
+                    {/* Warning card */}
+                    <div className="flex gap-3 bg-amber-50 border border-amber-200 rounded-2xl p-4 mb-5">
+                        <span className="text-xl flex-shrink-0 mt-0.5">⚠️</span>
+                        <p className="text-sm text-amber-900 font-medium leading-relaxed">{cfg.desc}</p>
+                    </div>
+
+                    {/* Sub-note */}
+                    <p className="text-[11px] text-gray-400 font-medium text-center mb-6">
+                        {type === 'scraper' 
+                            ? 'এটি একটি ব্যাকগ্রাউন্ড প্রসেস যা ডেটা আপডেট করবে · বাতিল করতে Escape বা Cancel চাপুন'
+                            : 'এই কাজটি Gemini API কল করবে এবং ভেক্টর ডাটা আপডেট করবে · বাতিল করতে Escape বা Cancel চাপুন'
+                        }
+                    </p>
+
+                    {/* Action buttons */}
+                    <div className="flex gap-3">
+                        <button
+                            onClick={onCancel}
+                            className="flex-1 py-3.5 rounded-2xl border-2 border-gray-200 text-gray-600 text-sm font-black hover:bg-gray-50 hover:border-gray-300 transition-all active:scale-95"
+                        >
+                            ✕ বাতিল
+                        </button>
+                        <button
+                            onClick={onConfirm}
+                            className={`flex-1 py-3.5 rounded-2xl text-white text-sm font-black ${cfg.btnCls} transition-all active:scale-95`}
+                        >
+                            ✓ হ্যাঁ, Sync করুন
+                        </button>
+                    </div>
+                </div>
+            </motion.div>
+        </div>
+    );
+}
+
+function AnalyticsTab({ stats }: { stats: any }) {
+    if (!stats) return <div className="p-10 text-center text-gray-400">📊 Loading metrics...</div>;
+    const handoverRate = stats.total_replies > 0 ? (stats.handovers / stats.total_replies) * 100 : 0;
+    return (
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-8 p-6">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="p-8 bg-purple-50 rounded-[2.5rem] border border-purple-100 flex flex-col justify-between shadow-sm">
+                    <p className="text-[10px] font-black text-purple-400 uppercase tracking-widest mb-4 font-mono">Total AI Autoreplies</p>
+                    <h3 className="text-4xl font-black text-purple-900 leading-none">{stats.total_replies || 0}</h3>
+                </div>
+                <div className="p-8 bg-amber-50 rounded-[2.5rem] border border-amber-100 flex flex-col justify-between shadow-sm">
+                    <p className="text-[10px] font-black text-amber-400 uppercase tracking-widest mb-4 font-mono">Handover Rate</p>
+                    <h3 className="text-4xl font-black text-amber-900 leading-none">{handoverRate.toFixed(1)}%</h3>
+                </div>
+                <div className="p-8 bg-emerald-50 rounded-[2.5rem] border border-emerald-100 flex flex-col justify-between shadow-sm">
+                    <p className="text-[10px] font-black text-emerald-400 uppercase tracking-widest mb-4 font-mono">AI Confidence Level</p>
+                    <h3 className="text-4xl font-black text-emerald-900 leading-none">{((stats.avg_confidence || 0) * 100).toFixed(0)}%</h3>
+                </div>
+            </div>
+            
+            <div className="bg-white p-8 rounded-[2.5rem] border border-gray-100 shadow-sm">
+                <h3 className="text-lg font-black text-gray-900 mb-8 flex items-center gap-2">
+                    <TrendingUp size={20} className="text-purple-600" /> 7-Day Performance Trend
+                </h3>
+                <div className="flex items-end justify-between h-48 gap-3">
+                    {stats.daily_trends.map((d: any, i: number) => {
+                        const totalHeight = Math.max(10, (d.total / (stats.total_replies || 1)) * 400); 
+                        return (
+                            <div key={i} className="flex-1 flex flex-col items-center gap-2 group">
+                                <div className="relative w-full flex flex-col justify-end h-32">
+                                    <div className="absolute -top-6 text-[10px] font-black text-gray-400 opacity-0 group-hover:opacity-100 transition-opacity">{d.total} replies</div>
+                                    <div className="w-full bg-purple-100 rounded-lg group-hover:bg-purple-200 transition-all" style={{ height: `${totalHeight}%` }}></div>
+                                    <div className="absolute bottom-0 w-full bg-rose-500 rounded-lg opacity-40" style={{ height: `${(d.handovers / (d.total || 1)) * totalHeight}%` }}></div>
+                                </div>
+                                <span className="text-[10px] font-black text-gray-400 uppercase tracking-tighter">{d.day.split('-').slice(1).join('/')}</span>
+                            </div>
+                        );
+                    })}
+                </div>
+            </div>
+        </motion.div>
+    );
+}
+
+function LogsTab({ logs, pagination, fetchLogs, onSelect }: { logs: any[], pagination: any, fetchLogs: (p: number) => void, onSelect: (log: any) => void }) {
+    return (
+        <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="flex flex-col h-full">
+            <div className="flex-1 overflow-x-auto p-2">
+                <table className="w-full text-left">
+                    <thead className="bg-gray-50/50">
+                        <tr>
+                            <th className="px-6 py-4 text-xs font-black text-gray-400 uppercase tracking-widest">Time</th>
+                            <th className="px-6 py-4 text-xs font-black text-gray-400 uppercase tracking-widest">Customer</th>
+                            <th className="px-6 py-4 text-xs font-black text-gray-400 uppercase tracking-widest">Status</th>
+                            <th className="px-6 py-4 text-xs font-black text-gray-400 uppercase tracking-widest text-right">Action</th>
+                        </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-50">
+                        {logs.map((log) => (
+                            <tr key={log.id} className="hover:bg-purple-50/30 transition-colors group cursor-pointer" onClick={() => onSelect(log)}>
+                                <td className="px-6 py-4 whitespace-nowrap font-mono text-[10px] text-gray-400">{new Date(log.timestamp).toLocaleTimeString()}</td>
+                                <td className="px-6 py-4 whitespace-nowrap font-bold text-gray-700">{log.customer_number}</td>
+                                <td className="px-6 py-4 whitespace-nowrap">
+                                    <span className={`px-2.5 py-1 rounded-lg text-[9px] font-black uppercase tracking-widest ${log.is_handover ? 'bg-rose-50 text-rose-600 border border-rose-100' : 'bg-purple-50 text-purple-600 border border-purple-100'}`}>
+                                        {log.is_handover ? 'Handover' : 'Solved'}
+                                    </span>
+                                </td>
+                                <td className="px-6 py-4 text-right">
+                                    <button className="text-purple-600 font-black text-[10px] uppercase underline tracking-widest opacity-0 group-hover:opacity-100 transition-all">Audit</button>
+                                </td>
+                            </tr>
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+            <div className="p-6 border-t border-gray-50 flex items-center justify-between">
+                <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Showing {logs.length} of {pagination.total} entries</span>
+                <div className="flex gap-2">
+                    <button disabled={pagination.page <= 1} onClick={(e) => { e.stopPropagation(); fetchLogs(pagination.page - 1); }} className="p-2.5 rounded-xl border border-gray-100 hover:bg-gray-50 disabled:opacity-20 transition-all"><ChevronLeft size={16} /></button>
+                    <button disabled={logs.length < pagination.limit} onClick={(e) => { e.stopPropagation(); fetchLogs(pagination.page + 1); }} className="p-2.5 rounded-xl border border-gray-100 hover:bg-gray-50 disabled:opacity-20 transition-all"><ChevronRight size={16} /></button>
+                </div>
+            </div>
+        </motion.div>
+    );
+}
+
+function LogDetailModal({ log, onClose }: { log: any, onClose: () => void }) {
+    if (!log) return null;
+    return (
+        <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-gray-900/40 backdrop-blur-md p-4" onClick={onClose}>
+            <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="bg-white w-full max-w-2xl rounded-[2.5rem] overflow-hidden shadow-2xl flex flex-col max-h-[90vh]" onClick={e => e.stopPropagation()}>
+                <div className="p-8 border-b border-gray-50 flex justify-between items-center bg-gradient-to-r from-purple-50/50 to-white">
+                    <div>
+                        <h4 className="text-lg font-black text-gray-900">Brain Audit</h4>
+                        <p className="text-[10px] text-gray-400 font-black uppercase tracking-widest">{log.customer_number} · {new Date(log.timestamp).toLocaleString()}</p>
+                    </div>
+                    <button onClick={onClose} className="w-10 h-10 bg-gray-50 flex items-center justify-center rounded-2xl hover:bg-rose-50 text-gray-400 hover:text-rose-500 transition-all border border-gray-100"><X size={20} /></button>
+                </div>
+                <div className="p-8 overflow-y-auto custom-scrollbar space-y-8">
+                    <div className="space-y-3">
+                        <label className="text-[10px] font-black text-purple-400 uppercase tracking-widest">Customer Message</label>
+                        <div className="p-5 bg-gray-50 rounded-2xl text-gray-700 font-medium italic border-l-4 border-gray-200">“{log.user_query}”</div>
+                    </div>
+                    <div className="space-y-3">
+                        <label className="text-[10px] font-black text-emerald-400 uppercase tracking-widest">AI Result</label>
+                        <div className="p-6 bg-purple-600 text-white rounded-[2rem] text-sm font-bold leading-relaxed shadow-lg">{log.ai_response}</div>
+                    </div>
+                    <div className="space-y-3">
+                        <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Source Context (RAG Snapshot)</label>
+                        <div className="p-6 bg-gray-900 text-gray-300 rounded-3xl text-[11px] font-mono leading-relaxed whitespace-pre-wrap border border-gray-800">{log.context_used || 'No intelligence fragments retrieved.'}</div>
+                    </div>
+                </div>
+            </motion.div>
+        </div>
     );
 }

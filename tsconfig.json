@@ -1,0 +1,51 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "moduleResolution": "node",
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "strict": false,
+    "skipLibCheck": true,
+    "maxNodeModuleJsDepth": 0,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["frontend/src/*"]
+    }
+  },
+  "exclude": [
+    "node_modules",
+    "**/node_modules/**",
+    "frontend/node_modules",
+    "backend/node_modules",
+    ".wwebjs_auth",
+    "**/.wwebjs_auth/**",
+    "backend/.wwebjs_auth/**",
+    ".wwebjs_cache",
+    "**/.wwebjs_cache/**",
+    "backend/.wwebjs_cache/**",
+    "**/uploads/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/coverage/**",
+    "**/*.db*",
+    "**/*.log",
+    "**/*.html",
+    "**/*.webm",
+    "**/*.mp4",
+    "**/*.ogg",
+    "**/Crashpad/**"
+  ],
+  "include": [
+    "backend/**/*.js",
+    "frontend/src/**/*",
+    "frontend/*.ts",
+    "frontend/*.js",
+    "frontend/*.tsx",
+    "frontend/*.jsx"
+  ]
+}

@@ -89,7 +89,18 @@ db.serialize(() => {
     );
   `);
 
-    /* bot_rules table removed */
+    db.run(`
+    CREATE TABLE IF NOT EXISTS ai_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      customer_number TEXT,
+      user_query TEXT,
+      ai_response TEXT,
+      context_used TEXT,
+      confidence_score REAL,
+      is_handover INTEGER DEFAULT 0,
+      timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
 
     // ── Unified Campaigns Tracker ───────────────────────────────────────────────────
     db.run(`
@@ -163,11 +174,13 @@ db.serialize(() => {
     });
 
     db.run(`
-    CREATE TABLE IF NOT EXISTS ai_products(
+    CREATE TABLE IF NOT EXISTS intelligent_product_catalog(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL,
         sku TEXT,
         price TEXT,
+        regular_price TEXT,
+        sale_price TEXT,
         description TEXT,
         full_description TEXT,
         image_url TEXT,
@@ -177,18 +190,22 @@ db.serialize(() => {
         manual_override INTEGER DEFAULT 0,
         vector_id TEXT,
         embedding TEXT,
+        technical_attributes TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
 
-    // Migration for ai_products
+    // Migration for intelligent_product_catalog (Enterprise Global Evolution)
     db.serialize(() => {
-        db.run("ALTER TABLE ai_products ADD COLUMN full_description TEXT", (err) => { /* ignore if exists */ });
-        db.run("ALTER TABLE ai_products ADD COLUMN variants TEXT", (err) => { /* ignore if exists */ });
-        db.run("ALTER TABLE ai_products ADD COLUMN regular_price TEXT", (err) => { /* ignore if exists */ });
-        db.run("ALTER TABLE ai_products ADD COLUMN sale_price TEXT", (err) => { /* ignore if exists */ });
-        db.run("ALTER TABLE ai_products ADD COLUMN sku TEXT", (err) => { /* ignore if exists */ });
+        const table = "intelligent_product_catalog";
+        // Safely add any missing columns (idempotent)
+        db.run(`ALTER TABLE ${table} ADD COLUMN full_description TEXT`, (err) => { });
+        db.run(`ALTER TABLE ${table} ADD COLUMN variants TEXT`, (err) => { });
+        db.run(`ALTER TABLE ${table} ADD COLUMN regular_price TEXT`, (err) => { });
+        db.run(`ALTER TABLE ${table} ADD COLUMN sale_price TEXT`, (err) => { });
+        db.run(`ALTER TABLE ${table} ADD COLUMN sku TEXT`, (err) => { });
+        db.run(`ALTER TABLE ${table} ADD COLUMN technical_attributes TEXT`, (err) => { });
     });
 
     db.run(`
@@ -201,6 +218,19 @@ db.serialize(() => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     `);
+
+    db.run(`
+    CREATE TABLE IF NOT EXISTS crawler_frontier(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        process_id TEXT,
+        url_hash TEXT,
+        url TEXT,
+        status TEXT DEFAULT 'pending', -- pending, visited, failed
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    `);
+
+    db.run(`CREATE INDEX IF NOT EXISTS idx_frontier_process_hash ON crawler_frontier(process_id, url_hash);`);
 
     // ── App Settings ──────────────────────────────────────────────────────────
     db.run(`
@@ -236,6 +266,18 @@ db.serialize(() => {
         filename TEXT,
         is_protected INTEGER DEFAULT 0, --Protected templates won't have their assets deleted
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    `);
+
+    // ── WhatsApp Account Metadata (Professional Auto-Connect) ────────────────
+    db.run(`
+    CREATE TABLE IF NOT EXISTS whatsapp_accounts(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wid TEXT UNIQUE,
+        number TEXT,
+        name TEXT,
+        platform TEXT,
+        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     `);
 
@@ -286,7 +328,9 @@ db.serialize(() => {
         { table: 'customers', name: 'city', type: 'TEXT' },
         { table: 'customers', name: 'company_name', type: 'TEXT' },
         { table: 'customers', name: 'last_purchase', type: 'TEXT' },
-        { table: 'messages', name: 'campaign_id', type: 'INTEGER' }
+        { table: 'messages', name: 'campaign_id', type: 'INTEGER' },
+        { table: 'customers', name: 'ai_paused', type: 'INTEGER DEFAULT 0' },
+        { table: 'customers', name: 'handover_requested', type: 'INTEGER DEFAULT 0' }
     ];
 
     columns.forEach(col => {
@@ -651,6 +695,69 @@ const dbUtils = {
                         resolve({ id: row.id, action: 'none' });
                     }
                 }
+            });
+        });
+    },
+
+    getConversationContext: (number, limit = 10) => {
+        const cleanNumber = formatNumber(number);
+        return new Promise((resolve, reject) => {
+            db.all(`
+                SELECT type, text FROM messages 
+                WHERE number = ? 
+                ORDER BY id DESC LIMIT ?
+            `, [cleanNumber, limit], (err, rows) => {
+                if (err) reject(err);
+                else {
+                    // Return Oldest to Newest for LLM context
+                    const history = rows.reverse().map(m => `${m.type === 'received' ? 'Customer' : 'AI'}: ${m.text}`).join('\n');
+                    resolve(history);
+                }
+            });
+        });
+    },
+
+    getCustomerAIStatus: (number) => {
+        const cleanNumber = formatNumber(number);
+        return new Promise((resolve, reject) => {
+            db.get('SELECT ai_paused, handover_requested FROM customers WHERE number = ?', [cleanNumber], (err, row) => {
+                if (err) reject(err);
+                else resolve(row || { ai_paused: 0, handover_requested: 0 });
+            });
+        });
+    },
+
+    updateCustomerAIStatusByNumber: (number, { ai_paused, handover_requested }) => {
+        const cleanNumber = formatNumber(number);
+        return new Promise((resolve, reject) => {
+            const fields = [];
+            const params = [];
+            if (ai_paused !== undefined) { fields.push('ai_paused = ?'); params.push(ai_paused); }
+            if (handover_requested !== undefined) { fields.push('handover_requested = ?'); params.push(handover_requested); }
+            
+            if (fields.length === 0) return resolve({ success: true });
+            
+            params.push(cleanNumber);
+            db.run(`UPDATE customers SET ${fields.join(', ')} WHERE number = ?`, params, function (err) {
+                if (err) reject(err);
+                else resolve({ success: true });
+            });
+        });
+    },
+
+    updateCustomerAIStatus: (id, { ai_paused, handover_requested }) => {
+        return new Promise((resolve, reject) => {
+            const fields = [];
+            const params = [];
+            if (ai_paused !== undefined) { fields.push('ai_paused = ?'); params.push(ai_paused); }
+            if (handover_requested !== undefined) { fields.push('handover_requested = ?'); params.push(handover_requested); }
+            
+            if (fields.length === 0) return resolve({ success: true });
+            
+            params.push(id);
+            db.run(`UPDATE customers SET ${fields.join(', ')} WHERE id = ?`, params, function (err) {
+                if (err) reject(err);
+                else resolve({ success: true });
             });
         });
     },
@@ -1954,12 +2061,15 @@ ta.template_id,
 
     // AI Products
     getAIProducts: (options = {}) => {
-        const { search, limit = 10000, offset = 0 } = options;
+        const { search, url, limit = 10000, offset = 0 } = options;
         return new Promise((resolve, reject) => {
-            let query = `SELECT * FROM ai_products`;
+            let query = `SELECT * FROM intelligent_product_catalog`;
             const params = [];
 
-            if (search) {
+            if (url) {
+                query += ` WHERE product_url = ? `;
+                params.push(url);
+            } else if (search) {
                 query += ` WHERE name LIKE ? OR description LIKE ? `;
                 params.push(`%${search}%`, `%${search}%`);
             }
@@ -1970,14 +2080,12 @@ ta.template_id,
                 if (err) reject(err);
                 else {
                     const parsed = rows.map(r => {
+                        let variants;
                         try {
                             let raw = r.variants ? (typeof r.variants === 'string' ? JSON.parse(r.variants) : r.variants) : null;
                             if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-                                // V3/New Format: { items, price_map, ... }
-                                // Preserve the full object so the frontend can see price_map
                                 variants = raw;
                             } else {
-                                // Legacy Format: [...] or null
                                 variants = Array.isArray(raw) ? { items: raw } : { items: [] };
                             }
                         } catch (e) {
@@ -1994,19 +2102,54 @@ ta.template_id,
         });
     },
 
+    countAIProducts: (options = {}) => {
+        const { search } = options;
+        return new Promise((resolve, reject) => {
+            let query = `SELECT COUNT(*) as count FROM intelligent_product_catalog`;
+            const params = [];
+            if (search) {
+                query += ` WHERE name LIKE ? OR description LIKE ? `;
+                params.push(`%${search}%`, `%${search}%`);
+            }
+            db.get(query, params, (err, row) => {
+                if (err) reject(err);
+                else resolve(row?.count || 0);
+            });
+        });
+    },
+
+    countAIProductsPendingVector: () => {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT COUNT(*) as count 
+                FROM intelligent_product_catalog 
+                WHERE embedding IS NULL OR embedding = 'null' OR embedding = '[]' OR embedding = ''
+            `;
+            db.get(query, (err, row) => {
+                if (err) reject(err);
+                else resolve(row?.count || 0);
+            });
+        });
+    },
+
     addAIProduct: (data) => {
         const { name, sku, price, description, full_description, image_url, product_url, variants, source = 'manual', manual_override = 1, vector_id, embedding, regular_price, sale_price } = data;
         return new Promise((resolve, reject) => {
             const stmt = db.prepare(`
-                INSERT INTO ai_products(
-        name, sku, price, description, full_description, image_url, product_url, variants, source, manual_override, vector_id, embedding, regular_price, sale_price
-    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO intelligent_product_catalog(
+        name, sku, price, description, full_description, image_url, product_url, variants, source, manual_override, vector_id, embedding, regular_price, sale_price, technical_attributes
+    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `);
             const variantsStr = variants ? (typeof variants === 'string' ? variants : JSON.stringify(variants)) : '{}';
-            stmt.run(name, sku, price, description, full_description, image_url, product_url, variantsStr, source, manual_override, vector_id, embedding, regular_price, sale_price, function (err) {
-                if (err) reject(err);
-                else resolve({ id: this.lastID });
-            });
+            stmt.run(
+                name, sku, price, description, full_description, image_url, product_url, variantsStr,
+                source, manual_override, vector_id, embedding, regular_price, sale_price,
+                data.technical_attributes || data.specifications || "",
+                function (err) {
+                    if (err) reject(err);
+                    else resolve({ id: this.lastID });
+                }
+            );
             stmt.finalize();
         });
     },
@@ -2030,13 +2173,14 @@ ta.template_id,
             if (embedding !== undefined) { fields.push('embedding = ?'); params.push(embedding); }
             if (regular_price !== undefined) { fields.push('regular_price = ?'); params.push(regular_price); }
             if (sale_price !== undefined) { fields.push('sale_price = ?'); params.push(sale_price); }
+            if (data.technical_attributes !== undefined || data.specifications !== undefined) { fields.push('technical_attributes = ?'); params.push(data.technical_attributes || data.specifications); }
 
             if (fields.length === 0) return resolve({ success: true });
 
             fields.push('updated_at = CURRENT_TIMESTAMP');
             params.push(id);
 
-            const stmt = db.prepare(`UPDATE ai_products SET ${fields.join(', ')} WHERE id = ? `);
+            const stmt = db.prepare(`UPDATE intelligent_product_catalog SET ${fields.join(', ')} WHERE id = ? `);
             stmt.run(...params, function (err) {
                 if (err) reject(err);
                 else resolve({ success: true });
@@ -2047,7 +2191,43 @@ ta.template_id,
 
     deleteAIProduct: (id) => {
         return new Promise((resolve, reject) => {
-            db.run(`DELETE FROM ai_products WHERE id = ? `, [id], function (err) {
+            db.run('DELETE FROM intelligent_product_catalog WHERE id = ? ', [id], function (err) {
+                if (err) reject(err);
+                else resolve({ success: true });
+            });
+        });
+    },
+
+    bulkDeleteAIProducts: (ids) => {
+        return new Promise((resolve, reject) => {
+            if (!ids || ids.length === 0) return resolve({ success: true, deleted: 0 });
+            const placeholders = ids.map(() => '?').join(',');
+            db.run(`DELETE FROM intelligent_product_catalog WHERE id IN (${placeholders})`, ids, function (err) {
+                if (err) reject(err);
+                else resolve({ success: true, deleted: this.changes });
+            });
+        });
+    },
+
+    bulkDeleteAIProductsByFilter: (filter = {}) => {
+        return new Promise((resolve, reject) => {
+            const { search } = filter;
+            let query = `DELETE FROM intelligent_product_catalog`;
+            const params = [];
+            if (search) {
+                query += ` WHERE name LIKE ? OR description LIKE ? `;
+                params.push(`%${search}%`, `%${search}%`);
+            }
+            db.run(query, params, function (err) {
+                if (err) reject(err);
+                else resolve({ success: true, deleted: this.changes });
+            });
+        });
+    },
+
+    deleteAIProduct: (id) => {
+        return new Promise((resolve, reject) => {
+            db.run(`DELETE FROM intelligent_product_catalog WHERE id = ? `, [id], function (err) {
                 if (err) reject(err);
                 else resolve({ success: true, changes: this.changes });
             });
@@ -2058,7 +2238,23 @@ ta.template_id,
         return new Promise((resolve, reject) => {
             if (!ids || ids.length === 0) return resolve({ success: true, changes: 0 });
             const placeholders = ids.map(() => '?').join(',');
-            db.run(`DELETE FROM ai_products WHERE id IN (${placeholders})`, ids, function (err) {
+            db.run(`DELETE FROM intelligent_product_catalog WHERE id IN (${placeholders})`, ids, function (err) {
+                if (err) reject(err);
+                else resolve({ success: true, changes: this.changes });
+            });
+        });
+    },
+
+    bulkDeleteAIProductsByFilter: (options = {}) => {
+        const { search } = options;
+        return new Promise((resolve, reject) => {
+            let query = `DELETE FROM intelligent_product_catalog`;
+            const params = [];
+            if (search) {
+                query += ` WHERE name LIKE ? OR description LIKE ? `;
+                params.push(`%${search}%`, `%${search}%`);
+            }
+            db.run(query, params, function (err) {
                 if (err) reject(err);
                 else resolve({ success: true, changes: this.changes });
             });
@@ -2115,7 +2311,146 @@ ta.template_id,
                 else resolve({ success: true, changes: this.changes });
             });
         });
-    }
+    },
+
+    // Frontier Management (Enterprise Optimization)
+    addToFrontier: (processId, url, status = 'pending') => {
+        const urlHash = require('crypto').createHash('md5').update(url).digest('hex');
+        return new Promise((resolve, reject) => {
+            const stmt = db.prepare(`INSERT OR REPLACE INTO crawler_frontier(process_id, url_hash, url, status) VALUES(?, ?, ?, ?)`);
+            stmt.run(processId, urlHash, url, status, function (err) {
+                if (err) reject(err);
+                else resolve({ id: this.lastID });
+            });
+            stmt.finalize();
+        });
+    },
+
+    checkFrontier: (processId, url) => {
+        const urlHash = require('crypto').createHash('md5').update(url).digest('hex');
+        return new Promise((resolve, reject) => {
+            db.get(`SELECT status FROM crawler_frontier WHERE process_id = ? AND url_hash = ?`, [processId, urlHash], (err, row) => {
+                if (err) reject(err);
+                else resolve(row ? row.status : null);
+            });
+        });
+    },
+
+    clearFrontier: (processId) => {
+        return new Promise((resolve, reject) => {
+            db.run(`DELETE FROM crawler_frontier WHERE process_id = ?`, [processId], function (err) {
+                if (err) reject(err);
+                else resolve({ changes: this.changes });
+            });
+        });
+    },
+
+    // ── WhatsApp Account Management ──────────────────────────────────────────
+    updateConnectedAccount: (data) => {
+        return new Promise((resolve, reject) => {
+            const { wid, number, name, platform } = data;
+            // Upsert: replace if wid exists (single session logic)
+            const stmt = db.prepare(`
+                INSERT INTO whatsapp_accounts (wid, number, name, platform, last_active) 
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(wid) DO UPDATE SET 
+                    number = excluded.number, 
+                    name = excluded.name, 
+                    platform = excluded.platform,
+                    last_active = CURRENT_TIMESTAMP
+            `);
+            stmt.run(wid, number, name, platform, function (err) {
+                if (err) reject(err);
+                else resolve({ id: this.lastID });
+            });
+            stmt.finalize();
+        });
+    },
+
+    getConnectedAccount: () => {
+        return new Promise((resolve, reject) => {
+            // Since it's single session, we just get the most recently active one
+            db.get('SELECT * FROM whatsapp_accounts ORDER BY last_active DESC LIMIT 1', (err, row) => {
+                if (err) reject(err);
+                else resolve(row || null);
+            });
+        });
+    },
+
+    clearConnectedAccount: () => {
+        return new Promise((resolve, reject) => {
+            db.run('DELETE FROM whatsapp_accounts', function (err) {
+                if (err) reject(err);
+                else resolve({ success: true });
+            });
+        });
+    },
+    // --- AI Brain Command Center Methods ---
+    logAIInteraction: (data) => {
+        return new Promise((resolve, reject) => {
+            const { customer_number, user_query, ai_response, context_used, confidence_score, is_handover } = data;
+            const stmt = db.prepare(`
+                INSERT INTO ai_logs (customer_number, user_query, ai_response, context_used, confidence_score, is_handover)
+                VALUES (?, ?, ?, ?, ?, ?)
+            `);
+            stmt.run(customer_number, user_query, ai_response, context_used, confidence_score, is_handover ? 1 : 0, function (err) {
+                if (err) reject(err);
+                else resolve({ id: this.lastID });
+            });
+            stmt.finalize();
+        });
+    },
+
+    getAILogs: (limit = 50, offset = 0) => {
+        return new Promise((resolve, reject) => {
+            db.all(`
+                SELECT * FROM ai_logs 
+                ORDER BY timestamp DESC 
+                LIMIT ? OFFSET ?
+            `, [limit, offset], (err, rows) => {
+                if (err) reject(err);
+                else {
+                    db.get('SELECT COUNT(*) as total FROM ai_logs', (countErr, row) => {
+                        resolve({ logs: rows, total: row?.total || 0 });
+                    });
+                }
+            });
+        });
+    },
+
+    getAIAnalytics: () => {
+        return new Promise((resolve, reject) => {
+            const queries = {
+                total_replies: "SELECT COUNT(*) as count FROM ai_logs",
+                handovers: "SELECT COUNT(*) as count FROM ai_logs WHERE is_handover = 1",
+                avg_confidence: "SELECT AVG(confidence_score) as avg FROM ai_logs WHERE confidence_score > 0",
+                daily_stats: `
+                    SELECT strftime('%Y-%m-%d', timestamp) as day, 
+                           COUNT(*) as total,
+                           SUM(CASE WHEN is_handover = 1 THEN 1 ELSE 0 END) as handovers
+                    FROM ai_logs 
+                    WHERE timestamp > datetime('now', '-7 days')
+                    GROUP BY day 
+                    ORDER BY day ASC
+                `
+            };
+
+            const stats = {};
+            db.get(queries.total_replies, (err1, r1) => {
+                stats.total_replies = r1?.count || 0;
+                db.get(queries.handovers, (err2, r2) => {
+                    stats.handovers = r2?.count || 0;
+                    db.get(queries.avg_confidence, (err3, r3) => {
+                        stats.avg_confidence = r3?.avg || 0;
+                        db.all(queries.daily_stats, (err4, r4) => {
+                            stats.daily_trends = r4 || [];
+                            resolve(stats);
+                        });
+                    });
+                });
+            });
+        });
+    },
 };
 
 module.exports = dbUtils;

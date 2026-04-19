@@ -1,6 +1,8 @@
 const SmartScraper = require('./scraper-service');
 const dbUtils = require('./db');
 const cron = require('node-cron');
+const os = require('os');
+const schedulerBus = require('./schedulerBus');
 
 class CrawlerService {
     constructor() {
@@ -9,6 +11,14 @@ class CrawlerService {
         this.cronJob = cron.schedule('0 */12 * * *', () => {
             this.runBackgroundCrawl();
         });
+
+        // V16.0 Auto-Calibration: Set safe limits based on host hardware
+        const totalMemMB = Math.round(os.totalmem() / 1024 / 1024);
+        // Dynamic Limit: 60% of total RAM or 2GB (whichever is lower for safety)
+        const safeLimit = Math.min(2048, Math.round(totalMemMB * 0.6));
+        process.env.MAX_SCRAPER_RAM_MB = process.env.MAX_SCRAPER_RAM_MB || safeLimit.toString();
+        
+        console.log(`[Crawler] 🛠️ Auto-Calibration: System RAM: ${totalMemMB}MB. Safe Threshold: ${process.env.MAX_SCRAPER_RAM_MB}MB`);
     }
 
     async runBackgroundCrawl(processId = null) {
@@ -64,69 +74,168 @@ class CrawlerService {
             }
 
             let savedCount = 0;
+            const sessionUniqueUrls = new Set();
             const scraper = new SmartScraper(processId);
+            global.scraperInstance = scraper; // Register for High-Fidelity callbacks
+            const processingUrls = new Set(); // Prevent SQLite Race Condition for duplicate insertions
+
+            // V14.0 Enterprise: Reset frontier for a fresh crawl if we have a process ID
+            if (processId) {
+                await dbUtils.clearFrontier(processId).catch(() => { });
+            }
+
             const data = await scraper.scan(targetUrl, {
                 isApiSync: true,
                 strictSinglePage: false,
                 maxPages: 0,
+                isStreaming: true, // v14.0: Don't store products in scraper RAM
+                persistentFrontier: true, // v14.0: Use SQLite for URL tracking
+                
+                // V16.0 Dynamic Braking System
+                // Allows the scraper to "breathe" by scaling delay based on RAM pressure
+                dynamicThrottling: true,
+                
                 onProduct: async (prod) => {
+                    // Enterprise Memory Shield: Protect the process from runaway RAM
+                    const rss = process.memoryUsage().rss / 1024 / 1024;
+                    const RAM_LIMIT = parseInt(process.env.MAX_SCRAPER_RAM_MB) || 1500;
+                    if (rss > RAM_LIMIT) { 
+                        if (global.gc) {
+                            console.log(`[Crawler] 🛡️ Memory Shield: High RAM (${Math.round(rss)}MB). Limit: ${RAM_LIMIT}MB. Pulsing GC...`);
+                            global.gc();
+                        }
+                    }
+
                     // STREICER VALIDATION: Must have name AND price to be a valid product from scrape
                     if (prod.name && prod.price && prod.name.length > 3) {
-                        const existingProducts = await dbUtils.getAIProducts({ search: prod.name });
-                        const isManual = existingProducts.some(p => p.manual_override === 1 && p.name === prod.name);
+                        
+                        // Concurrent lock check
+                        if (processingUrls.has(prod.product_url)) {
+                            // Wait a tiny bit and retry fetching to ensure we perform an UPDATE instead of a duplicate INSERT
+                            await new Promise(r => setTimeout(r, 800));
+                        }
+                        processingUrls.add(prod.product_url);
 
-                        if (!isManual) {
-                            const existing = existingProducts.find(p => p.product_url === prod.product_url || p.name === prod.name);
-                            let result;
+                        try {
+                            // V14.2: Precision De-duplication (URL-first)
+                            const existingByUrl = await dbUtils.getAIProducts({ url: prod.product_url });
+                            const existing = existingByUrl[0];
 
-                            if (existing) {
-                                // v8.3: Futuristic Reconciliation Intelligence
-                                const oldPrice = String(existing.price || "").replace(/[^0-9.]/g, '');
-                                const newPrice = String(prod.price || "").replace(/[^0-9.]/g, '');
-                                const priceChanged = oldPrice && newPrice && oldPrice !== newPrice;
+                            // Manual Override Protection (Check by name)
+                            const manualCheck = await dbUtils.getAIProducts({ search: prod.name });
+                            const isManual = manualCheck.some(p => p.manual_override === 1 && p.name === prod.name);
 
-                                const oldVariants = existing.variants ? JSON.parse(existing.variants) : { items: [] };
-                                const newVariants = typeof prod.variants === 'string' ? JSON.parse(prod.variants) : (prod.variants || { items: [] });
-                                const variantsExpanded = newVariants.items && oldVariants.items && newVariants.items.length > oldVariants.items.length;
+                            if (!isManual) {
+                                let result;
+                                // ... (rest of the safeParse/safeStringify logic)
+                                const safeParse = (data) => {
+                                    if (!data) return { items: [] };
+                                    if (typeof data === 'object') return data;
+                                    if (typeof data === 'string' && (data.includes('[object Object]') || !data.trim())) return { items: [] };
+                                    try { return JSON.parse(data); } catch (e) { return { items: [] }; }
+                                };
 
-                                result = await dbUtils.updateAIProduct(existing.id, {
-                                    sku: prod.sku,
-                                    price: prod.price,
-                                    description: prod.description,
-                                    full_description: prod.full_description,
-                                    image_url: prod.imageUrl,
-                                    variants: typeof prod.variants === 'object' ? JSON.stringify(prod.variants) : prod.variants,
-                                    regular_price: prod.regular_price,
-                                    sale_price: prod.sale_price,
-                                    source: 'scraper'
-                                });
-
-                                let updateLog = `📝 Updated: ${prod.name}`;
-                                if (priceChanged) updateLog += ` (🏷️ Price: ${existing.price} -> ${prod.price})`;
-                                if (variantsExpanded) updateLog += ` (📦 New Variants found!)`;
-
-                                log(updateLog, 'success');
-                            } else {
-                                result = await dbUtils.addAIProduct({
-                                    name: prod.name,
-                                    sku: prod.sku,
-                                    price: prod.price,
-                                    description: prod.description,
-                                    full_description: prod.full_description,
-                                    image_url: prod.imageUrl,
-                                    product_url: prod.product_url,
-                                    variants: prod.variants,
-                                    regular_price: prod.regular_price,
-                                    sale_price: prod.sale_price,
-                                    source: 'scraper',
-                                    manual_override: 0
-                                });
-                                log(`✨ New product found: ${prod.name}${prod.sale_price ? ` (Offer: ${prod.sale_price})` : ''}`, 'success');
-
-                                // Detailed Variation Logs for Terminal 
-                                if (prod.variants) {
+                                const safeStringify = (obj) => {
                                     try {
-                                        const v = typeof prod.variants === 'string' ? JSON.parse(prod.variants) : prod.variants;
+                                        if (typeof obj === 'string') {
+                                            if (obj.includes('[object Object]')) return JSON.stringify({ items: [] });
+                                            return obj;
+                                        }
+                                        return JSON.stringify(obj || { items: [] });
+                                    } catch (e) { return JSON.stringify({ items: [] }); }
+                                };
+
+                                if (existing) {
+                                    // v8.3: Futuristic Reconciliation Intelligence
+                                    const oldPrice = String(existing.price || "").replace(/[^0-9.]/g, '');
+                                    const newPrice = String(prod.price || "").replace(/[^0-9.]/g, '');
+                                    const priceChanged = oldPrice && newPrice && oldPrice !== newPrice;
+
+                                    const oldVariants = safeParse(existing.variants);
+                                    const newVariants = typeof prod.variants === 'object' ? prod.variants : safeParse(prod.variants);
+                                    
+                                    // V18.0: Merge Intelligence - Fidelity Downgrade Protection
+                                    // Protect valid variant data from being overwritten by inferior HTML scrapes
+                                    const hasOldVariants = (oldVariants.items?.length || 0) > 0;
+                                    const hasNewVariants = (newVariants.items?.length || 0) > 0;
+                                    const variantsExpanded = (newVariants.items?.length || 0) > (oldVariants.items?.length || 0);
+                                    
+                                    let variantsToSave = safeStringify(prod.variants);
+                                    let variantLog = "";
+
+                                    if (hasOldVariants && !hasNewVariants) {
+                                        // 🛡️ Protection Triggered: New scrape is empty/inferior
+                                        variantsToSave = existing.variants;
+                                        variantLog = " (🛡️ Variants Preserved)";
+                                    } else if (variantsExpanded) {
+                                        variantLog = " (📦 New Variants found!)";
+                                    }
+
+                                    result = await dbUtils.updateAIProduct(existing.id, {
+                                        sku: prod.sku,
+                                        price: prod.price,
+                                        description: prod.description,
+                                        full_description: prod.full_description,
+                                        image_url: prod.imageUrl,
+                                        variants: variantsToSave,
+                                        regular_price: prod.regular_price,
+                                        sale_price: prod.sale_price,
+                                        composition: prod.composition || prod.materials,
+                                        handling_guidelines: prod.handling_guidelines || prod.wash_instructions,
+                                        technical_attributes: prod.technical_attributes || prod.specifications,
+                                        source: 'scraper'
+                                    });
+
+                                    let updateLog = `📝 Updated: ${prod.name}`;
+                                    if (priceChanged) updateLog += ` (🏷️ Price: ${existing.price} -> ${prod.price})`;
+                                    updateLog += variantLog;
+
+                                    log(updateLog, 'success');
+                                } else {
+                                    // V18.2: Creation Fidelity Guard
+                                    // If a new Shopify product is found via a "weak" source (like batch JSON),
+                                    // force a high-fidelity sync for this one product before saving.
+                                    const currentVariants = typeof prod.variants === 'object' ? prod.variants : safeParse(prod.variants);
+                                    const hasVariants = (currentVariants.items?.length || 0) > 0;
+                                    const isShopify = prod.product_url && (prod.product_url.includes('turaag.com') || prod.product_url.includes('shopify'));
+                                    
+                                    if (!hasVariants && isShopify) {
+                                        console.log(`[Crawler] 🛡️ Creation Guard: Empty variants for NEW product. Forcing High-Fidelity Sync for ${prod.name}...`);
+                                        if (global.scraperInstance) {
+                                            const success = await global.scraperInstance.tryApiSync(prod.product_url);
+                                            if (success) {
+                                                // Since tryApiSync (in streaming mode) triggers its own onProduct callback,
+                                                // the product is already saved. We return here to prevent double insertion.
+                                                console.log(`[Crawler] ✅ Creation Guard: High-Fidelity recovery complete for ${prod.name}. Skipping redundant entry.`);
+                                                return;
+                                            }
+                                        }
+                                    }
+
+                                    result = await dbUtils.addAIProduct({
+                                        name: prod.name,
+                                        sku: prod.sku,
+                                        price: prod.price,
+                                        description: prod.description,
+                                        full_description: prod.full_description,
+                                        image_url: prod.imageUrl,
+                                        product_url: prod.product_url,
+                                        variants: safeStringify(prod.variants),
+                                        regular_price: prod.regular_price,
+                                        sale_price: prod.sale_price,
+                                        composition: prod.composition || prod.materials,
+                                        handling_guidelines: prod.handling_guidelines || prod.wash_instructions,
+                                        technical_attributes: prod.technical_attributes || prod.specifications,
+                                        source: 'scraper',
+                                        manual_override: 0
+                                    });
+
+                                    const finalVariants = typeof prod.variants === 'object' ? prod.variants : safeParse(prod.variants);
+                                    log(`✨ New product found: ${prod.name}${prod.sale_price ? ` (Offer: ${prod.sale_price})` : ''}${(finalVariants.items?.length || 0) > 0 ? "" : " (⚠️ Empty Variants)"}`, 'success');
+
+                                    // Detailed Variation Logs for Terminal 
+                                    if (prod.variants) {
+                                        const v = safeParse(prod.variants);
                                         const items = v.items || (Array.isArray(v) ? v : []);
                                         if (items.length > 0) {
                                             log(`   📦 Variations Found: ${items.length} options`, 'info');
@@ -135,19 +244,30 @@ class CrawlerService {
                                                 log(`   💰 Prices: ${prices}${Object.keys(v.price_map).length > 3 ? '...' : ''}`, 'info');
                                             }
                                         }
-                                    } catch (e) { }
+                                    }
                                 }
-                            }
 
-                            // Real-time product list update
-                            schedulerBus.emit('service_event', {
-                                event: 'new_ai_product_scraped',
-                                payload: { product: { ...prod, id: existing ? existing.id : result?.id } }
-                            });
-                            savedCount++;
+                                // Real-time product list update
+                                schedulerBus.emit('service_event', {
+                                    event: 'new_ai_product_scraped',
+                                    payload: { product: { ...prod, id: existing ? existing.id : result?.id } }
+                                });
+                                
+                                if (!sessionUniqueUrls.has(prod.product_url)) {
+                                    savedCount++;
+                                    sessionUniqueUrls.add(prod.product_url);
+                                }
+                            } // Closes if (!isManual)
+                        } catch (err) {
+                            console.error("[Crawler] DB Persist Error:", err.message);
+                        } finally {
+                            // Free up lock after 5 seconds automatically regardless of success or failure
+                            setTimeout(() => {
+                                processingUrls.delete(prod.product_url);
+                            }, 5000);
                         }
-                    }
-                }
+                    } // Closes if (prod.name && prod.price && prod.name.length > 3)
+                } // Closes onProduct: async (prod) => { ... }
             }, (update) => {
                 if (processId) {
                     if (update.message) {
@@ -193,7 +313,7 @@ class CrawlerService {
 
             log(`
     ╔════════════ AI BRAIN SYNC SUMMARY ════════════╗
-    ║ 🧠 Intelligence Harvested: ${savedCount} Products processed
+    ║ 🧠 Unique Intelligence Nodes: ${savedCount} Products synced
     ║ 📡 Source: ${targetUrl.split('/')[2]}
     ║ 🧬 Health: 100% Data Integrity Verified
     ║ 💾 Status: AI Knowledge Base Updated

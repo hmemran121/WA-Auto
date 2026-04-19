@@ -1,14 +1,16 @@
-# Crawl Health Report: https://www.shwapno.com
+# Crawl Health Report: https://sailor.clothing
 
-- **Duration:** 36.1s
-- **Total Visited:** 86
-- **Successful:** 81
-- **Skipped (304):** 3
-- **Failed:** 2
+- **Duration:** 368.0s
+- **Total Visited:** 0
+- **Successful:** 317
+- **Skipped (304):** 0
+- **Failed:** 3
 
 ## Error Distribution
 - `ERR_BAD_REQUEST`: 2
+- `ECONNABORTED`: 1
 
 ## Persistent Failures (Backlog)
-- [ ] [https://www.shwapno.com/wp-sitemap.xml](https://www.shwapno.com/wp-sitemap.xml) - Error: Network Failure/Timeout
-- [ ] [https://www.shwapno.com/beauty-and-health](https://www.shwapno.com/beauty-and-health) - Error: Network Failure/Timeout
+- [ ] [https://sailor.clothing/sitemap/sitemap.xml](https://sailor.clothing/sitemap/sitemap.xml) - Error: Network Failure/Timeout
+- [ ] [https://sailor.clothing/sitemap/sitemap_index.xml](https://sailor.clothing/sitemap/sitemap_index.xml) - Error: Network Failure/Timeout
+- [ ] [https://sailor.clothing/category/polo-xubuh](https://sailor.clothing/category/polo-xubuh) - Error: Network Failure/Timeout

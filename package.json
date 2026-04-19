@@ -6,8 +6,13 @@
         "postinstall": "npm run install-all",
         "install-all": "cd backend && npm install && cd ../frontend && npm install",
         "dev": "npx -y kill-port 3001 && concurrently \"npm run backend\" \"npm run frontend\"",
-        "backend": "cd backend && concurrently \"npm run dev\" \"npm run service\"",
-        "frontend": "cd frontend && npm run dev"
+        "backend": "cd backend && concurrently \"npm run dev\" \"npm run service\" \"npm run watchdog\"",
+        "frontend": "cd frontend && npm run dev",
+        "watchdog": "node backend/resource-watchdog.js",
+        "start": "node --max-old-space-size=512 --expose-gc backend/server.js",
+        "whatsapp": "cd backend && npm run service",
+        "dev:full": "concurrently \"npm run start\" \"npm run whatsapp\" \"npm run frontend\" \"npm run watchdog\"",
+        "test": "echo \"Error: no test specified\" && exit 1"
     },
     "devDependencies": {
         "concurrently": "^8.2.2"

@@ -3,6 +3,11 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
+const dbUtils = require('./db');
+const crypto = require('crypto');
+const BASELINE = require('./scraper-intelligence');
+const scraperDriver = require('./scraper-driver');
+const structuralAnalyzer = require('./structural-analyzer');
 
 const USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -17,6 +22,8 @@ class SmartScraper {
         this.onProductCallback = null;
         this.visited = new Set();
         this.queue = [];
+        this.isStreaming = false; // V14.0 Enterprise: Stateless Mode
+        this.usePersistentFrontier = false; 
         this.failedBacklog = []; // v8.2: Persistent Failure Backlog
         this.healthReport = {
             startTime: new Date(),
@@ -45,6 +52,33 @@ class SmartScraper {
         this.domain = "";
         this.isStopped = false;
         this.isPaused = false;
+        this.useDynamic = false; // Flag to enable dynamic fallback
+    }
+
+    // V9.8 Enterprise Stability: Type-Safe JSON Handlers
+    safeJsonParse(data, fallback = null) {
+        if (!data) return fallback;
+        if (typeof data === 'object') return data;
+        if (typeof data === 'string' && (data.includes('[object Object]') || data.trim() === '')) return fallback;
+        try {
+            return JSON.parse(data);
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    safeJsonStringify(data, fallback = "") {
+        if (typeof data === 'string') {
+            if (data.trim().startsWith('{') || data.trim().startsWith('[')) return data;
+            // Prevent [object Object] serialization
+            if (data.includes('[object Object]')) return fallback;
+            return JSON.stringify({ items: [], text: data }); // Wrap plain strings
+        }
+        try {
+            return JSON.stringify(data || fallback);
+        } catch (e) {
+            return fallback;
+        }
     }
 
     normalizeUrl(urlStr) {
@@ -52,11 +86,11 @@ class SmartScraper {
             const urlObj = new URL(urlStr);
             urlObj.hash = '';
 
-            // Remove non-essential marketing/session query parameters
+            // Remove non-essential marketing/session/shopify-variant query parameters
             const noiseParams = [
                 '_wpnonce', 'add_to_wishlist', 'add-to-cart', 'removed_item', 'wishlist_id',
                 'fbclid', 'gclid', 'utm_source', 'utm_medium', 'utm_campaign',
-                'utm_term', 'utm_content', 'v'
+                'utm_term', 'utm_content', 'v', 'variant', '_pos', '_sid', '_ss', '_v', '_fid', '_ke'
             ];
             noiseParams.forEach(p => urlObj.searchParams.delete(p));
 
@@ -71,6 +105,73 @@ class SmartScraper {
         if (!str) return "";
         const bnDigits = ['০', '১', '২', '৩', '৪', '৫', '৬', '৭', '৮', '৯'];
         return str.toString().replace(/[০-৯]/g, match => bnDigits.indexOf(match));
+    }
+
+    // V16.1: Shopify Analytics Meta Extraction (Enterprise Core)
+    extractShopifyMeta($) {
+        try {
+            const scripts = $('script').toArray();
+            for (const script of scripts) {
+                const content = $(script).html() || "";
+                
+                // Strategy A: Direct ShopifyAnalytics.meta assignments
+                if (content.includes('ShopifyAnalytics.meta')) {
+                    const match = content.match(/var\s+meta\s*=\s*(\{.*?"variants"\s*:\s*\[.*?\]\s*\});/s);
+                    if (match) {
+                        const data = this.safeJsonParse(match[1]);
+                        if (data?.product?.variants) {
+                            const map = {};
+                            data.product.variants.forEach(v => {
+                                if (v.id) {
+                                    map[String(v.id)] = {
+                                        title: v.public_title || v.name || "",
+                                        price: (v.price && v.price > 100000) ? (v.price / 100) : v.price, // Shopify meta prices can be in cents
+                                        sku: v.sku || ""
+                                    };
+                                }
+                            });
+                            if (Object.keys(map).length > 0) return map;
+                        }
+                    }
+                }
+
+                // Strategy B: web-pixels-manager data (often very rich)
+                if (content.includes('productVariants')) {
+                    const match = content.match(/["']productVariants["']\s*:\s*(\[.*?\])/s);
+                    if (match) {
+                        const variants = this.safeJsonParse(match[1]);
+                        if (Array.isArray(variants)) {
+                            const map = {};
+                            variants.forEach(v => {
+                                if (v.id) {
+                                    map[String(v.id)] = {
+                                        title: v.title || v.untranslatedTitle || "",
+                                        price: v.price?.amount || v.price,
+                                        sku: v.sku || ""
+                                    };
+                                }
+                            });
+                            if (Object.keys(map).length > 0) return map;
+                        }
+                    }
+                }
+
+                // Strategy C: Specific tracking calls (like trekkie / track)
+                if (content.includes('ShopifyAnalytics.lib.track')) {
+                    const matches = content.matchAll(/"variantId":(\d+),.*?,"variant":"(.*?)"/g);
+                    const map = {};
+                    let found = false;
+                    for (const m of matches) {
+                        map[m[1]] = m[2].replace(/\\?\//g, '/').trim();
+                        found = true;
+                    }
+                    if (found) return map;
+                }
+            }
+        } catch (e) {
+            console.log("[Scraper] Shopify Meta extraction failed:", e.message);
+        }
+        return null;
     }
 
     parsePrice(priceStr) {
@@ -304,6 +405,25 @@ class SmartScraper {
         const skuByClass = container.find('.sku, .product_sku, .product-sku, [itemprop="sku"]').first().text().trim();
         if (skuByClass && skuByClass.length < 50) return skuByClass;
 
+        // 3. Technical Table Search
+        const tableRows = container.find('tr, li').filter((_, el) => {
+            const text = $(el).text().toLowerCase();
+            return (text.includes('sku') || text.includes('model') || text.includes('code')) && !text.includes('postal');
+        });
+
+        if (tableRows.length > 0) {
+            const tableSku = tableRows.first().find('td, span, div').last().text().trim();
+            if (tableSku && /^[A-Z0-9\d-]+$/i.test(tableSku) && tableSku.length > 3 && tableSku.length < 30 && !/select|choose/i.test(tableSku)) {
+                return tableSku;
+            }
+        }
+
+        // 4. Data Attributes
+        const dataSku = container.attr('data-sku') || container.find('[data-sku]').first().attr('data-sku') || 
+                        container.find('[data-product-sku]').first().attr('data-product-sku') || 
+                        container.find('[data-variant-sku]').first().attr('data-variant-sku');
+        if (dataSku && dataSku.length < 40) return dataSku;
+
         return "";
     }
 
@@ -393,7 +513,14 @@ class SmartScraper {
     normalizeProduct(prod) {
         let normalized = { ...prod };
         normalized.name = (prod.name || "").replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
-        normalized.sku = (prod.sku || "").trim();
+        
+        // V15.1: Aggressive SKU Extraction from Variants if root SKU is missing
+        let rootSku = (prod.sku || "").trim();
+        if (!rootSku && prod.variants) {
+            const firstV = Array.isArray(prod.variants) ? prod.variants[0] : (prod.variants.items ? prod.variants.items[0] : null);
+            if (firstV && firstV.sku) rootSku = firstV.sku;
+        }
+        normalized.sku = rootSku;
 
         const priceData = this.parsePrice(prod.price || "");
 
@@ -409,12 +536,46 @@ class SmartScraper {
             normalized.sale_price = `৳ ${normalized.sale_price}`;
         }
 
+        // V9.7: Deal Intelligence - If sale price is same as regular, clear it to prevent redundant 'Offer' state
+        if (normalized.regular_price && normalized.sale_price) {
+            const regNum = parseFloat(normalized.regular_price.replace(/[^0-9.]/g, ''));
+            const saleNum = parseFloat(normalized.sale_price.replace(/[^0-9.]/g, ''));
+            if (!isNaN(regNum) && regNum === saleNum) {
+                normalized.sale_price = "";
+            }
+        }
+
         // Logic: Main price is ALWAYS the sale price if available
-        let finalP = String(normalized.sale_price || prod.price || priceData.price || "").trim();
+        let finalP = String(normalized.sale_price || prod.price || "").trim();
+
+        // V14.3: Hard Price Search Fallback (moved from here to extractProducts to remove $ dependency)
+        // If finalP is still empty, it means no price was found from sale, prod.price, or priceData.price.
+        // The meta price fallback should now be handled in extractProducts and passed in prod.price if found.
+
         if (finalP && !finalP.includes('৳') && !finalP.includes('Tk')) {
             finalP = `৳ ${finalP}`;
         }
         normalized.price = finalP;
+
+        // V15.0: Strict Description Mapping Logic (No Fallbacks)
+        normalized.description = String(prod.description || "").trim();
+        normalized.full_description = String(prod.full_description || "").trim();
+
+        // V15.0: Unified Technical Attributes Consolidation
+        let techAttrs = [String(prod.technical_attributes || "").trim()].filter(Boolean);
+        
+        if (normalized.full_description) {
+            const sections = normalized.full_description.split(/(?=##|\*\*|Materials:|Composition:|Wash Instruction:|Care Instruction:|\n[A-Z][a-z]+:)/);
+            sections.forEach(s => {
+                const lower = s.toLowerCase();
+                if (lower.includes('material') || lower.includes('composition') || lower.includes('care') || lower.includes('wash')) {
+                    const val = s.replace(/.*?materials?|composition|care|wash/i, '').replace(/^[:\s#\*]+/, '').trim();
+                    if (val && !techAttrs.includes(val)) techAttrs.push(val);
+                }
+            });
+        }
+        
+        normalized.technical_attributes = techAttrs.join(' | ');
 
         // V3: Structured Variants with Price Map
         let rawVariants = [];
@@ -427,53 +588,59 @@ class SmartScraper {
             rawVariants = Array.isArray(prod.variants) ? prod.variants : [];
         }
 
-        let sizes = new Set();
-        let colors = new Set();
+        const sizesArr = [];
+        const colorsArr = [];
+        const colorRegex = /Color|Colour|রঙ|ভেন্টোর/i;
+        const sizeRegex = /Size|সাইজ|মাপ/i;
+        
+        // V17.1: Fix ReferenceError - Define minPrice and processedVariants
         let minPrice = Infinity;
+        const processedVariants = [];
 
-        const processedVariants = rawVariants.map(v => {
-            const vPrice = this.toEngDigits(v.price || "");
-            const numericPrice = parseFloat(vPrice.replace(/[^0-9.]/g, ''));
-
-            if (!isNaN(numericPrice) && numericPrice < minPrice && numericPrice > 0) {
-                minPrice = numericPrice;
-            }
-
-            const val = String(v.value || v.title || "").trim();
+        rawVariants.forEach(v => {
+            const lowerType = (v.type || "Option").toLowerCase();
+            const val = String(v.value || "").trim();
             if (val) {
-                // Heuristic: Identify if value is likely a color or size
-                if (val.match(/red|blue|green|black|white|yellow|pink|purple|orange|brown/i)) {
-                    colors.add(val);
-                } else if (val.match(/S|M|L|XL|XXL|XXXL|[0-9]+(?:kg|gm|ml|ltr|পিস|টি)/i)) {
-                    sizes.add(val);
+                // V18.0: Multi-Tier Validation (Dynamic Baseline Integration)
+                const isAntiPattern = BASELINE.variants.antiPatterns.some(p => p.test(val));
+                const isExactSku = val === (prod.sku || v.sku || "");
+                
+                if (isAntiPattern || isExactSku) {
+                    // Reject known anti-patterns (SKUs, boilerplates) unless they match white-listed sizes
+                    const isWhiteListedSize = BASELINE.variants.sizes.includes(val.toLowerCase());
+                    if (!isWhiteListedSize) return; 
+                }
+
+                // Collect for processedVariants
+                processedVariants.push(v);
+                
+                // Track minPrice for baseline normalization
+                if (v.price) {
+                    const p = parseFloat(String(v.price).replace(/[^0-9.]/g, ''));
+                    if (!isNaN(p) && p < minPrice && p > 0) minPrice = p;
+                }
+
+                const checkVal = val.toLowerCase();
+                if (colorRegex.test(lowerType) || BASELINE.variants.colors.includes(checkVal) || this.isColor(val)) {
+                    if (!colorsArr.includes(val)) colorsArr.push(val);
+                } else if (sizeRegex.test(lowerType) || BASELINE.variants.sizes.includes(checkVal) || this.isSize(val)) {
+                    if (!sizesArr.includes(val)) sizesArr.push(val);
                 } else {
-                    sizes.add(val); // Default to sizes for generic variants
+                    // Smart fallback for untyped variants (replaces legacy 15-char rule)
+                    if (this.isColor(val)) {
+                       if (!colorsArr.includes(val)) colorsArr.push(val);
+                    } else if (this.isSize(val) || (val.length < 10 && !/^[A-Z\d-]{5,}$/.test(val))) {
+                       if (!sizesArr.includes(val)) sizesArr.push(val);
+                    }
                 }
             }
-
-            return {
-                type: v.type || "Option",
-                value: val,
-                price: vPrice,
-                regular_price: v.regular_price || "",
-                sale_price: v.sale_price || "",
-                sku: v.sku || "",
-                imageUrl: this.cleanImageUrl(v.image_url || v.imageUrl || "")
-            };
         });
 
-        // Sync priceMap from processed variants if empty
-        if (Object.keys(priceMap).length === 0 && processedVariants.length > 0) {
-            processedVariants.forEach(v => {
-                if (v.value && v.price) priceMap[v.value] = v.price;
-            });
-        }
-
-        normalized.variants = JSON.stringify({
+        normalized.variants = this.safeJsonStringify({
             items: processedVariants,
             price_map: priceMap,
-            sizes: Array.from(sizes),
-            colors: Array.from(colors)
+            sizes: sizesArr,
+            colors: colorsArr
         });
 
         // Dynamic Baseline Price: If variants exist, ensure main price is the Lowest available
@@ -492,11 +659,73 @@ class SmartScraper {
     cleanDescription(el) {
         // Remove scripts, styles, and hidden elements from description
         el.find('script, style, .hidden, #hidden, [style*="display:none"]').remove();
-        return el.text().replace(/\s+/g, ' ').trim();
+        let text = el.text().replace(/\s+/g, ' ').trim();
+        return this.cleanText(text);
     }
 
-    async scan(startUrl, options = { strictSinglePage: false, isApiSync: true, maxPages: 0, onProduct: null }, onUpdate = null) {
+    /**
+     * V15.0: Intelligent Semantic Mapping
+     * Consolidates all product attributes strictly into technical_attributes.
+     */
+    intelligentSemanticMapping(prod, html, details) {
+        let techAttrs = [String(prod.technical_attributes || "").trim()].filter(Boolean);
+
+        // Heuristic 1: Food products
+        if (html.match(/Ingredients|উপাদানসমূহ|Nutrition|পুষ্টিগুণ/i)) {
+            const ingMatch = html.match(/(?:Ingredients|উপাদানসমূহ):\s*([^<\n]+)/i);
+            if (ingMatch) techAttrs.push(`Ingredients: ${ingMatch[1].trim()}`);
+
+            const storeMatch = html.match(/(?:Storage|সংরক্ষণ):\s*([^<\n]+)/i);
+            if (storeMatch) techAttrs.push(`Storage: ${storeMatch[1].trim()}`);
+        }
+
+        // Heuristic 2: General fallback keywords
+        const sourceHtml = html || prod.full_description || prod.description || "";
+
+        const materials = this.extractMaterialsFromHtml(sourceHtml);
+        if (materials && !techAttrs.some(a => a.includes(materials))) techAttrs.push(`Materials: ${materials}`);
+
+        const wash = this.extractWashFromHtml(sourceHtml);
+        if (wash && !techAttrs.some(a => a.includes(wash))) techAttrs.push(`Care: ${wash}`);
+
+        const attrs = this.extractTechnicalAttributesFromHtml(sourceHtml);
+        if (attrs && !techAttrs.some(a => a.includes(attrs))) techAttrs.push(attrs);
+
+        // V14.2/V15.0: Structured nextData support (Sailor style)
+        if (details) {
+            if (details.composition && !techAttrs.some(a => a.includes(details.composition))) techAttrs.push(`Composition: ${details.composition}`);
+            if (details.fabrication && !techAttrs.some(a => a.includes(details.fabrication))) techAttrs.push(`Fabrication: ${details.fabrication}`);
+            if (details.care || details.care_level || details.handling) {
+                const care = details.care || details.care_level || details.handling;
+                if (!techAttrs.some(a => a.includes(care))) techAttrs.push(`Care: ${care}`);
+            }
+            if (details.fit && !techAttrs.some(a => a.includes(details.fit))) techAttrs.push(`Fit: ${details.fit}`);
+            if (details.segment && !techAttrs.some(a => a.includes(details.segment))) techAttrs.push(`Segment: ${details.segment}`);
+            if (details.embellishment && !techAttrs.some(a => a.includes(details.embellishment))) techAttrs.push(`Embellishment: ${details.embellishment}`);
+        }
+
+        return { technical_attributes: techAttrs.join(' | ') };
+    }
+
+    isColor(val) {
+        if (!val) return false;
+        const colors = ['red', 'blue', 'green', 'black', 'white', 'yellow', 'brown', 'pink', 'purple', 'grey', 'gray', 'orange', 'silver', 'gold', 'beige', 'navy', 'maroon', 'teal', 'cyan', 'magenta', 'lime', 'olive', 'indigo', 'violet', 'charcoal', 'ivory', 'khaki', 'tan', 'teal', 'লাল', 'নীল', 'সবুজ', 'কালো', 'সাদা', 'হলুদ', 'বাদামী', 'গোলাপী', 'বেগুনি', 'ধুসর', 'অরেঞ্জ'];
+        return colors.some(c => val.toLowerCase().includes(c));
+    }
+
+    isSize(val) {
+        if (!val) return false;
+        const sizes = ['s', 'm', 'l', 'xl', 'xxl', 'xxxl', '2xl', '3xl', '4xl', '5xl', 'xs', 'small', 'medium', 'large', 'extra large', 'সাইজ', 'স্মল', 'লার্জ', 'মিডিয়াম'];
+        const numPatt = /^\d+(\.\d+)?\s*(cm|mm|inch|in|ft|m|kg|gm|ml|l| টি| পিস)?$/i;
+        return sizes.includes(val.toLowerCase()) || numPatt.test(val);
+    }
+
+
+    async scan(startUrl, options = { strictSinglePage: false, isApiSync: true, maxPages: 0, onProduct: null, isStreaming: false, persistentFrontier: false }, onUpdate = null) {
         this.onProductCallback = options.onProduct;
+        this.isStreaming = options.isStreaming || false;
+        this.usePersistentFrontier = options.persistentFrontier || false;
+
         const log = (msg, type = 'info') => {
             console.log(`[Scraper] ${msg}`);
             if (onUpdate) onUpdate({ message: msg, type });
@@ -524,6 +753,9 @@ class SmartScraper {
             this.queue.push({ url: this.baseUrl, priority: 100, type: 'home' });
 
             let pagesProcessed = 0;
+            let consecutiveStalePages = 0; // V17.3: Early Exit for pagination branches
+            const STALE_LIMIT = 4; // Abort after 4 pages with no NEW products
+
             // v8.3: Default to Unlimited (0) for background tasks, otherwise use provided limit
             let currentLimit = options.strictSinglePage ? 1 : (options.maxPages === 0 ? Infinity : (options.maxPages || 10000));
             const baseStagnationThreshold = 50;
@@ -564,9 +796,17 @@ class SmartScraper {
                 const { url, priority, type, lastScraped } = this.queue.shift();
                 const normalized = this.normalizeUrl(url);
 
-                if (this.visited.has(normalized)) continue;
-                this.visited.add(normalized);
-                pagesProcessed = this.visited.size;
+                // Enterprise Frontier Check
+                if (this.usePersistentFrontier && this.processId) {
+                    const status = await dbUtils.checkFrontier(this.processId, normalized);
+                    if (status === 'visited') continue;
+                    await dbUtils.addToFrontier(this.processId, normalized, 'visited');
+                } else {
+                    if (this.visited.has(normalized)) continue;
+                    this.visited.add(normalized);
+                }
+
+                pagesProcessed++;
 
                 log(`🕷️ Visiting [${type.toUpperCase()}] (${pagesProcessed}/${currentLimit}): ${url}`);
 
@@ -599,7 +839,7 @@ class SmartScraper {
 
                     this.healthReport.successCount++;
                     const $ = cheerio.load(html);
-                    await this.processPage($, url, type);
+                    await this.processPage($, url, type, consecutiveStalePages);
                     this.data.visitedUrls.push(url);
 
                     const afterCount = this.data.products.length;
@@ -608,10 +848,24 @@ class SmartScraper {
                     // v8.2.1: Activity Detection (Product found OR New Links discovered)
                     const activityDetected = (afterCount > beforeCount) || (afterQueueSize > beforeQueueSize);
 
+                    // V17.3: Precision Stale Limit for Pagination
+                    if (type === 'pagination' || type === 'category') {
+                        if (afterCount > beforeCount) {
+                            consecutiveStalePages = 0; // Reset on success
+                        } else {
+                            consecutiveStalePages++;
+                            if (consecutiveStalePages >= STALE_LIMIT) {
+                                log(`⚠️ Discovery Alert: No NEW unique products found in ${consecutiveStalePages} consecutive pages. Aborting [${type.toUpperCase()}] branch.`, 'warning');
+                                // We don't 'break' the whole loop, we just don't queue more pagination for this branch?
+                                // Actually, since we shift from queue, we simply skip adding next pages in discoverPagination
+                            }
+                        }
+                    }
+
                     if (activityDetected || type === 'sitemap') {
                         lastProductAddedAt = pagesProcessed; // Heartbeat: Reset stagnation
 
-                        if (afterCount > currentLimit * 0.4 && currentLimit < 10000) {
+                        if (afterCount > currentLimit * 0.4 && currentLimit < 10000 && !options.strictSinglePage) {
                             currentLimit = Math.min(10000, currentLimit + 500);
                             log(`📈 Adaptive Scaling: Expanding limit to ${currentLimit}...`);
                         }
@@ -654,26 +908,68 @@ class SmartScraper {
                 }
 
                 // v8.2: Self-Correction Pass (Triggered when main queue is low or limit reached)
-                if (this.queue.length === 0 && this.failedBacklog.length > 0 && this.visited.size < currentLimit) {
+                if (this.queue.length === 0 && this.failedBacklog.length > 0 && (this.usePersistentFrontier || this.visited.size < currentLimit)) {
                     onUpdate({ message: `🔄 Initiating Self-Correction Pass on ${this.failedBacklog.length} failed pages...`, type: 'info' });
                     const toRetry = this.failedBacklog.splice(0, 10); // Batch retry
-                    toRetry.forEach(item => {
-                        this.visited.delete(this.normalizeUrl(item.url)); // Allow re-visit
+                    for (const item of toRetry) {
+                        const norm = this.normalizeUrl(item.url);
+                        this.visited.delete(norm);
+                        if (this.usePersistentFrontier && this.processId) {
+                            // Reset status to allow re-visit in database
+                            await dbUtils.addToFrontier(this.processId, norm, 'pending').catch(() => {});
+                        }
                         this.queue.push({ ...item, priority: 50, retryPass: true });
-                    });
+                    }
                 }
 
-                // Prevent event loop block
-                await new Promise(resolve => setTimeout(resolve, 100));
+                // Prevent event loop block and allow GC pulse
+                // V16.0 Dynamic Braking System (Adaptive Delay)
+                let adaptiveDelay = 100;
+                if (options.dynamicThrottling) {
+                    const currentRss = process.memoryUsage().rss / 1024 / 1024;
+                    const limit = parseInt(process.env.MAX_SCRAPER_RAM_MB) || 1500;
+                    const usageRatio = currentRss / limit;
+
+                    if (usageRatio > 0.9) {
+                        adaptiveDelay = 2000; // 🛑 Heavy Brake: 2s delay
+                        if (pagesProcessed % 5 === 0) log(`[Brake] 🔴 Critical RAM (${Math.round(currentRss)}MB). Throttling: 2s delay.`, 'warning');
+                    } else if (usageRatio > 0.75) {
+                        adaptiveDelay = 800;  // ⚠️ Soft Brake: 800ms delay
+                        if (pagesProcessed % 10 === 0) log(`[Brake] 🟡 High RAM (${Math.round(currentRss)}MB). Throttling: 800ms delay.`, 'info');
+                    } else if (usageRatio > 0.5) {
+                        adaptiveDelay = 300;  // 🐢 Caution: 300ms delay
+                    }
+                }
+                await new Promise(resolve => setTimeout(resolve, adaptiveDelay));
+
+                // Production Memory Heartbeat: Trigger GC if available after long sessions
+                if (pagesProcessed % 50 === 0 && global.gc) {
+                    console.log(`[Scraper] 💓 Memory Heartbeat: Triggering Garbage Collection...`);
+                    global.gc();
+                }
+
+                // v14.0 Enterprise Guard: Cycle 'visited' set if it grows beyond extreme limits (e.g. 5k entries)
+                // This prevents the Set from becoming a memory leak in massive recursive crawls.
+                if (this.visited.size > 5000) {
+                    console.log(`[Scraper] 🛡️ Queue Guard: visited set reaching threshold. Pruning...`);
+                    // We keep only the last 1000 to maintain some deduplication without bloating RAM
+                    const lastVisited = Array.from(this.visited).slice(-1000);
+                    this.visited = new Set(lastVisited);
+                }
             }
 
             if (this.queue.length === 0) stopReason = "Queue Exhausted";
             log(`✅ Scan Complete. Reason: ${stopReason}. Extracted ${this.data.products.length} Products.`, 'success');
+            
+            // Clean up browser resources
+            await scraperDriver.close();
+            
             this.healthReport.endTime = new Date();
             this.generateHealthReport();
             return this.data;
         } catch (error) {
             log(`❌ Scraper Error: ${error.message}`, 'error');
+            await scraperDriver.close();
             this.healthReport.endTime = new Date();
             this.healthReport.errors['CRITICAL_SCAN_ERROR'] = (this.healthReport.errors['CRITICAL_SCAN_ERROR'] || 0) + 1;
             this.generateHealthReport();
@@ -710,8 +1006,16 @@ class SmartScraper {
                             price_map[val] = this.toEngDigits(String(v.price));
                         }
 
+                        // Intelligent Type Mapping: Skip generic "Title" or "Option" if real names exist
+                        let typeName = "Variant";
+                        if (p.options && p.options[0]) {
+                            const rawName = p.options[0].name;
+                            const isGeneric = BASELINE.variants.antiPatterns.some(ap => ap.test(rawName));
+                            typeName = isGeneric ? "Variant" : rawName;
+                        }
+
                         return {
-                            type: p.options && p.options[0] ? p.options[0].name : "Variant",
+                            type: typeName,
                             value: val,
                             price: v.price,
                             regular_price: v.compare_at_price || v.price,
@@ -724,17 +1028,24 @@ class SmartScraper {
                     // Match variant images if possible
                     let mainImg = p.image ? p.image.src : (p.images && p.images[0] ? p.images[0].src : "");
 
+                    const bodyHtml = p.body_html || "";
+                    const semanticData = this.intelligentSemanticMapping({}, bodyHtml, null);
+
                     await this.addProduct(this.normalizeProduct({
                         name: p.title,
                         price: p.variants && p.variants[0] ? p.variants[0].price : "",
                         regular_price: p.variants && p.variants[0] ? p.variants[0].compare_at_price : "",
                         sale_price: p.variants && p.variants[0] ? p.variants[0].price : "",
-                        full_description: p.body_html ? this.cleanHtmlDescription(p.body_html) : "",
+                        full_description: bodyHtml ? this.cleanHtmlDescription(bodyHtml) : "",
                         description: "",
                         imageUrl: mainImg,
                         product_url: url.split('?')[0],
+                        sku: p.variants && p.variants[0] ? p.variants[0].sku : "",
                         variants: variants,
-                        price_map: price_map
+                        price_map: price_map,
+                        composition: semanticData.composition,
+                        handling_guidelines: semanticData.handling_guidelines,
+                        technical_attributes: semanticData.technical_attributes
                     }));
                     return true;
                 }
@@ -759,17 +1070,24 @@ class SmartScraper {
                         };
                     });
 
+                    const bodyHtml = p.body_html || "";
+                    const semanticData = this.intelligentSemanticMapping({}, bodyHtml, null);
+
                     await this.addProduct(this.normalizeProduct({
                         name: p.title,
                         price: p.variants && p.variants[0] ? p.variants[0].price : "",
                         regular_price: p.variants && p.variants[0] ? p.variants[0].compare_at_price : "",
                         sale_price: p.variants && p.variants[0] ? p.variants[0].price : "",
-                        full_description: p.body_html ? this.cleanHtmlDescription(p.body_html) : "",
+                        full_description: bodyHtml ? this.cleanHtmlDescription(bodyHtml) : "",
                         description: "",
                         imageUrl: p.images && p.images[0] ? p.images[0].src : "",
                         product_url: new URL(`/products/${p.handle}`, this.baseUrl).href,
+                        sku: p.variants && p.variants[0] ? p.variants[0].sku : "",
                         variants: variants,
-                        price_map: price_map
+                        price_map: price_map,
+                        composition: semanticData.composition,
+                        handling_guidelines: semanticData.handling_guidelines,
+                        technical_attributes: semanticData.technical_attributes
                     }));
                 }
                 return true;
@@ -801,7 +1119,7 @@ class SmartScraper {
 
             const response = await axios.get(url, {
                 headers,
-                timeout: 20000, // Increased timeout for heavy sites
+                timeout: 20000, 
                 validateStatus: s => s === 200 || s === 304
             });
 
@@ -810,15 +1128,37 @@ class SmartScraper {
                 return "NOT_MODIFIED";
             }
 
-            return response.data;
+            const html = response.data;
+            
+            // v21.0: Structural Check for JS-Heavy Pages
+            // If the page is very small or contains "Loading..." markers but no real content, switch to dynamic
+            const $ = cheerio.load(html);
+            const bodyLength = $('body').text().length;
+            const hasSkeletons = html.includes('loading...') || html.includes('skeleton') || html.includes('dynamic-content');
+            
+            // If it's a product page but we have very little text, or a specific platform known for JS rendering
+            const isProduct = url.includes('/product/') || url.includes('/products/');
+            
+            if (isProduct && (bodyLength < 500 || hasSkeletons)) {
+                console.log(`[Scraper] 🔄 Low Content Detected (${bodyLength} chars). Switching to Dynamic Mode for: ${url}`);
+                return await scraperDriver.fetchDynamicPage(url);
+            }
+
+            return html;
         } catch (error) {
             const isConnReset = error.code === 'ECONNRESET' || error.message.includes('disconnected');
             const isTimeout = error.code === 'ECONNABORTED' || error.message.includes('timeout');
 
             if ((isConnReset || isTimeout) && retryCount < maxRetries) {
                 console.log(`[Scraper] 🔄 Retrying ${url} (${retryCount + 1}/${maxRetries}) due to ${error.code || 'timeout'}...`);
-                await new Promise(r => setTimeout(r, 2000 * (retryCount + 1))); // Exponential backoff
+                await new Promise(r => setTimeout(r, 2000 * (retryCount + 1))); 
                 return this.fetchPage(url, retryCount + 1, lastScraped);
+            }
+
+            // Fallback for 403/Blocked - try dynamic once
+            if (error.response && (error.response.status === 403 || error.response.status === 401)) {
+                console.log(`[Scraper] 🛡️ Access Denied (403). Attempting Dynamic Bypass for: ${url}`);
+                return await scraperDriver.fetchDynamicPage(url);
             }
 
             // Track error health
@@ -861,7 +1201,7 @@ class SmartScraper {
         }
     }
 
-    async processPage($, url, type) {
+    async processPage($, url, type, consecutiveStalePages = 0) {
         // v8.2: Unified processing and discovery entry point
         // Only extract product/brand info for HTML pages, not XML sitemaps
         if (type !== 'sitemap') {
@@ -872,7 +1212,7 @@ class SmartScraper {
         if (type !== 'product') {
             await this.discoverSitemaps($, url);
             await this.discoverLinks($, url);
-            await this.discoverPagination($, url);
+            await this.discoverPagination($, url, consecutiveStalePages);
         }
     }
 
@@ -973,7 +1313,10 @@ class SmartScraper {
         }
     }
 
-    discoverPagination($, currentUrl) {
+    async discoverPagination($, currentUrl, consecutiveStalePages = 0) {
+        // V17.3 Early Exit: If this branch is stale, don't look for more pages
+        if (consecutiveStalePages >= 4) return;
+
         const paginationSelectors = [
             '.next', '.pagination-next', '.next-page', 'a[rel="next"]',
             '.woocommerce-pagination .next', '.pagination .active + li a',
@@ -997,6 +1340,8 @@ class SmartScraper {
                 if (href && (
                     text.includes('next') ||
                     text.includes('পরবর্তী') ||
+                    text.includes('load more') ||
+                    text.includes('আরও') ||
                     text === '>' ||
                     text === '»' ||
                     (text.match(/^\d+$/) && parseInt(text) > 1) // Digits can be page numbers
@@ -1004,8 +1349,17 @@ class SmartScraper {
                     // If it's just a number, it's a page link, lower priority but still useful
                     const priority = text.match(/^\d+$/) ? 90 : 95;
                     this.queuePagination(href, currentUrl, priority);
+                    foundNext = true;
                 }
             });
+        }
+
+        // V17.2: Next.js Discovery on Category Pages
+        if (!foundNext && currentUrl.includes('category') || currentUrl.includes('collections')) {
+            const nextData = this.extractNextData($);
+            if (nextData && nextData.pageProps && nextData.pageProps.products && nextData.pageProps.products.next_page_url) {
+                this.queuePagination(nextData.pageProps.products.next_page_url, currentUrl, 98);
+            }
         }
     }
 
@@ -1085,6 +1439,8 @@ class SmartScraper {
 
         // 4. Product Extraction (Heuristic + Schema)
         await this.extractProducts($, url);
+
+        return this.data.products.length > 0 ? this.data.products[0] : null;
     }
 
     cleanHtmlDescription(html) {
@@ -1095,6 +1451,8 @@ class SmartScraper {
         // Convert some blocks to newlines for readability
         let text = decoded.replace(/<br\s*\/?>/gi, "\n")
             .replace(/<\/p>/gi, "\n")
+            .replace(/<\/td>/gi, " ") // Treat table cells as space-separated
+            .replace(/<\/tr>/gi, "\n") // Treat table rows as newline-separated
             .replace(/<\/li>/gi, "\n- ")
             .replace(/<li>/gi, "")
             .replace(/<script[^>]*>([\s\S]*?)<\/script>/gi, "") // Remove internal scripts
@@ -1106,10 +1464,9 @@ class SmartScraper {
             .replace(/<[^>]*>?/gm, '');
 
         // Final entity cleanup and space normalization
-        let clean = text.replace(/\n\s*\n/g, '\n').replace(/\s+/g, ' ').trim();
+        let clean = text.replace(/\n\s*\n/g, '\n').replace(/ +/g, ' ').trim();
 
         // High Precision Fix: Strip Breadcrumb & UI Noise (Home / Category / Price / SKU prefixes)
-        // Common pattern: "Home / পপুলার | Popular চালের গুড়া | Rice Flour 150৳ SKU: 102-RIC-PWD- Category: পপুলার | Popular"
         const noisePatterns = [
             /^Home\s*\/.*?\s*Popular\s*/i,
             /^Home\s*\/.*?\s*Category:.*?\s*/i,
@@ -1118,13 +1475,102 @@ class SmartScraper {
             /Category:\s*.*?\s*$/i,
             /Add to Wishlist/gi,
             /Add to cart/gi,
-            /Description\s+Additional\s+পণ্য বিবরণী:/i // Specific request fix
+            /Description\s+Additional\s+পণ্য বিবরণী:/i,
+            /Bag\s*Bag/gi // Specific noise found in Turaag
         ];
 
         noisePatterns.forEach(p => clean = clean.replace(p, ''));
+        
+        // V17.5: Dynamic Baseline Noise Filtering
+        BASELINE.noise.product.forEach(p => clean = clean.replace(p, ''));
 
         return clean.trim();
     }
+
+    extractMaterialsFromDetails(details) {
+        if (!details) return "";
+        const parts = [];
+        if (details.composition && details.composition.data && Array.isArray(details.composition.data)) {
+            details.composition.data.forEach(c => {
+                if (c.name) parts.push(c.name);
+            });
+        }
+        if (details.fabrication) parts.push(details.fabrication);
+        return parts.join(', ');
+    }
+
+    extractMaterialsFromHtml(html) {
+        if (!html) return "";
+        // V12.2: Tag-Aware Sectioning - Skips tags (like </h2>) immediately after the keyword
+        const headerMatch = html.match(/[#\s]*(?:Materials?|Fabrication|Composition|Fabric|পণ্য উপাদান)(?:[:\s#\n-]+|<\/?[^>]+>)+/i);
+        if (headerMatch) {
+            const startIdx = headerMatch.index + headerMatch[0].length;
+            const remaining = html.substring(startIdx);
+            // End markers: Next header, next summary, next ## header, or end of a details block
+            const endMatch = remaining.match(/(?:<h[1-6]|<summary[^>]*>|##|Care Instruction|Wash Instruction|Features|Technical|<\/details>)/i);
+            const content = endMatch ? remaining.substring(0, endMatch.index) : remaining;
+            const clean = content.replace(/<[^>]*>?/gm, '').replace(/\s+/g, ' ').trim();
+            if (clean && clean.length > 2) return clean;
+        }
+
+        // Fallback: Keyword search
+        const fallback = html.match(/(?:92%|95%|100%|Cotton|Jersey|Linen|Viscose|Polyester|Denim|Canvas)[^<\n.]*/i);
+        return fallback ? fallback[0].trim() : "";
+    }
+
+    extractWashFromHtml(html) {
+        if (!html) return "";
+        // V12.2: Tag-Aware Sectioning
+        const headerMatch = html.match(/[#\s]*(?:Wash Instructions?|Care Instructions?|Handling Guidelines?|Care Level|ধৌত করার নির্দেশাবলী|ধোয়ার নিয়ম)(?:[:\s#\n-]+|<\/?[^>]+>)+/i);
+        if (headerMatch) {
+            const startIdx = headerMatch.index + headerMatch[0].length;
+            const remaining = html.substring(startIdx);
+            const endMatch = remaining.match(/(?:<h[1-6]|<summary[^>]*>|##|Materials|Fabrication|Features|Technical|<\/details>)/i);
+            const content = endMatch ? remaining.substring(0, endMatch.index) : remaining;
+            const clean = content.replace(/<[^>]*>?/gm, '').replace(/\s+/g, ' ').trim();
+            if (clean && clean.length > 2) return clean;
+        }
+
+        // Fallback: Standard phrases
+        const fallback = html.match(/(?:Hand wash|Machine wash|Dry clean|Cool iron|Do not bleach|Wash separately|Wash in)[^<\n.]*/i);
+        return fallback ? fallback[0].trim() : "";
+    }
+
+    extractTechnicalAttributesFromHtml(html) {
+        if (!html) return "";
+        // V12.0: Heuristic for bullet points and specifications
+        const attributes = [];
+
+        // 1. Look for explicit header
+        const headerMatch = html.match(/[#\s]*(?:Technical Attributes|Features|Specifications|বৈশিষ্ট্যসমূহ)[:\s#\n-]+/i);
+        if (headerMatch) {
+            const startIdx = headerMatch.index + headerMatch[0].length;
+            const remaining = html.substring(startIdx);
+            const endMatch = remaining.match(/(?:<h[1-6]|<details|<summary|##|Materials|Wash Instruction)/i);
+            const content = endMatch ? remaining.substring(0, endMatch.index) : remaining;
+            const listItems = content.match(/<li>(.*?)<\/li>/gi);
+            if (listItems) {
+                listItems.forEach(item => attributes.push(item.replace(/<[^>]*>?/gm, '').trim()));
+            } else {
+                const plainText = content.replace(/<[^>]*>?/gm, '').split('\n');
+                plainText.forEach(line => {
+                    const l = line.trim();
+                    if (l && l.length > 5) attributes.push(l);
+                });
+            }
+        }
+
+        // 2. Fallback: Generic bullet point extraction if no header found
+        if (attributes.length === 0) {
+            const listMatch = html.match(/<li>(.*?)<\/li>/gi);
+            if (listMatch) {
+                listMatch.slice(0, 5).forEach(m => attributes.push(m.replace(/<[^>]*>?/gm, '').trim()));
+            }
+        }
+
+        return attributes.filter(a => a.length > 0).join(' | ');
+    }
+
 
     calculateImageScore($, imgEl, productName) {
         let score = 0;
@@ -1146,6 +1592,32 @@ class SmartScraper {
         return score;
     }
 
+
+    extractName($, container) {
+        const h1 = (container && container.length > 0 ? container.find('h1') : $('h1')).first().text().trim();
+        if (h1) return h1;
+        const ogTitle = $('meta[property="og:title"]').attr('content');
+        if (ogTitle) return ogTitle.split('|')[0].trim();
+        return $('title').text().split('|')[0].split('-')[0].trim() || "Product";
+    }
+
+    extractImage($, container) {
+        if (!container || container.length === 0) return "";
+        let bestImg = "";
+        let maxScore = -100;
+
+        container.find('img').each((i, el) => {
+            const $img = $(el);
+            const score = this.calculateImageScore($, $img, "");
+            if (score > maxScore) {
+                maxScore = score;
+                bestImg = $img.attr('src') || $img.attr('data-src') || $img.attr('data-lazy-src') || "";
+            }
+        });
+
+        return this.cleanImageUrl(bestImg) || $('meta[property="og:image"]').attr('content') || "";
+    }
+
     getMainProductId($, url) {
         // 1. Check Body Class (WooCommerce Standard)
         const bodyClass = $('body').attr('class') || "";
@@ -1165,20 +1637,101 @@ class SmartScraper {
 
     getMainProductSlug(url) {
         try {
-            const parts = url.split('?')[0].replace(/\/$/, "").split('/');
-            return parts[parts.length - 1];
+            const parts = url.split('/');
+            return parts[parts.length - 1] || parts[parts.length - 2];
         } catch (e) { return ""; }
     }
 
+    cleanProductName(name) {
+        if (!name) return "";
+        let clean = name.trim();
+        // V17.5: Dynamic Baseline Noise Filtering
+        BASELINE.noise.product.forEach(p => clean = clean.replace(p, ''));
+        return clean.replace(/\s+/g, ' ').trim();
+    }
+
+    /**
+     * V9.6: Next.js __NEXT_DATA__ Engine
+     * Extracts high-fidelity product data from internal Next.js state
+     */
+    extractNextData($) {
+        try {
+            const nextDataScript = $('script#__NEXT_DATA__').html();
+            if (!nextDataScript) return null;
+            const data = JSON.parse(nextDataScript);
+            // Sailor and many Next.js e-commerce sites store details here
+            // For Sailor, fabrication, care_level, fit, segment, composition are available in details
+            const details = data.props?.pageProps?.details || data.props?.pageProps?.product || null;
+            if (!details) return null;
+
+            // v14.2: Enriched detail extraction
+            return {
+                ...details,
+                composition: details.composition?.data?.map(c => c.name).join(', ') || details.composition || "",
+                fabrication: details.fabrication || "",
+                care: details.care_instruction || details.care_level || "",
+                fit: details.fit || ""
+            };
+        } catch (e) {
+            console.log("[Scraper] Error parsing __NEXT_DATA__:", e.message);
+            return null;
+        }
+    }
 
     extractVariants($, context = null, sourceUrl = "") {
         const variants = [];
         const price_map = {};
         const scope = context || $('body');
+        
+        // V16.0: Shopify Specific Mapping (ID to Data)
+        const shopifyMap = this.extractShopifyMeta($);
+        if (shopifyMap) {
+            console.log(`[Scraper] Found Shopify Meta Mapping with ${Object.keys(shopifyMap).length} entries`);
+            
+            // If Shopify Meta is found, we can pre-populate variants with high precision
+            Object.values(shopifyMap).forEach(v => {
+                if (v.title && !variants.some(existing => existing.value === v.title)) {
+                    const cleanTitle = v.title.replace(/[-_]/g, ' ').trim();
+                    if (v.price) price_map[cleanTitle] = this.toEngDigits(String(v.price));
+                    variants.push({
+                        type: "Variant",
+                        value: cleanTitle,
+                        price: v.price,
+                        sku: v.sku
+                    });
+                }
+            });
+        }
 
-        // V8.0: Context-Aware Selection
+        // Context-Aware Selection
         const mainId = this.getMainProductId($, sourceUrl);
         const mainSlug = this.getMainProductSlug(sourceUrl);
+
+        // 0. V9.6 Strategy: Next.js Data Source (Highest Fidelity for platforms like Sailor)
+        const nextData = this.extractNextData($);
+        if (nextData && Array.isArray(nextData.variant)) {
+            nextData.variant.forEach(v => {
+                const attributes = v.variant || v.name || v.sku;
+                const regPrice = v.base_price || v.price;
+                const salePrice = (v.base_discounted_price && v.base_discounted_price !== v.base_price) ? v.base_discounted_price : "";
+                const price = salePrice || regPrice;
+
+                if (attributes && price) {
+                    const cleanAttr = attributes.replace(/[-_]/g, ' ');
+                    price_map[cleanAttr] = this.toEngDigits(String(price));
+                    variants.push({
+                        type: "Variant",
+                        value: cleanAttr,
+                        price: price,
+                        regular_price: regPrice,
+                        sale_price: salePrice,
+                        sku: v.barcode || v.sku,
+                        image_url: v.image || null,
+                        stock: v.stock !== undefined ? v.stock : null
+                    });
+                }
+            });
+        }
 
         // 1. Dynamic Strategy A: Standard WooCommerce variations_form
         let variationsForm = null;
@@ -1201,8 +1754,6 @@ class SmartScraper {
             });
         }
 
-        if (!variationsForm) variationsForm = allForms.first();
-
         if (variationsForm && variationsForm.length > 0) {
             try {
                 const rawAttr = variationsForm.attr('data-product_variations');
@@ -1220,18 +1771,19 @@ class SmartScraper {
 
                         if (attributes && finalPrice) {
                             price_map[attributes] = this.toEngDigits(String(finalPrice));
-                            variants.push({
-                                type: "Variant",
-                                value: attributes,
-                                price: finalPrice,
-                                regular_price: reg,
-                                sale_price: sale,
-                                sku: v.sku,
-                                image_url: v.image ? v.image.src : null
-                            });
+                            if (!variants.some(varItem => varItem.value === attributes)) {
+                                variants.push({
+                                    type: "Variant",
+                                    value: attributes,
+                                    price: finalPrice,
+                                    regular_price: reg,
+                                    sale_price: sale,
+                                    sku: v.sku,
+                                    image_url: v.image ? v.image.src : null
+                                });
+                            }
                         }
                     });
-                    if (variants.length > 0) return { variants, price_map };
                 }
             } catch (e) {
                 console.log("[Scraper] Error parsing variations JSON:", e.message);
@@ -1243,14 +1795,17 @@ class SmartScraper {
             '.variable-item', '.swatch-item', '.ux-swatch', '.swatch',
             '.button-variable-item', '.variable-item:not(.disabled)',
             '.wvs-style-squared li', '.woo-variation-swatches li',
+            'label[for*="option"]', 'input[type="radio"] + label',
+            'input[name*="option"]', 'input[name*="attribute"]', // Added more direct input selectors
             '[data-value]', '[data-attribute_name]'
         ];
 
         let foundSwatches = scope.find(swatchSelectors.join(', '));
+        console.log(`[Scraper Debug] Found swatches: ${foundSwatches.length}`);
         if (foundSwatches.length > 0) {
             foundSwatches.each((_, el) => {
                 const $el = $(el);
-                const text = $el.text().trim() || $el.attr('data-value') || $el.attr('title');
+                const text = ($el.text().trim() || $el.attr('data-value') || $el.val() || $el.attr('title') || "").trim();
 
                 // Find label in proximity
                 let type = "Option";
@@ -1259,7 +1814,11 @@ class SmartScraper {
                     type = parentRow.find('.label, label, .attribute-label').text().replace(/:/g, '').trim() || "Option";
                 }
 
-                if (text && text.length < 30 && !variants.some(v => v.value === text)) {
+                // V15.1: Enhanced SKU Exclusion Logic for Variant Values
+                const isCodeLike = /^[A-Z0-9-]{6,20}$/.test(text); // Check if text looks like a SKU/ID
+                const hasLabel = variants.some(v => v.value === text);
+                
+                if (text && text.length < 40 && !hasLabel && !isCodeLike) {
                     variants.push({
                         type: type,
                         value: text,
@@ -1267,8 +1826,40 @@ class SmartScraper {
                     });
                 }
             });
-            if (variants.length > 0) return { variants, price_map };
         }
+
+        // 2.5 Dynamic Strategy D: Shopify Advanced (Radios/Fieldsets)
+        const shopifySelectors = [
+            'variant-radios', 'fieldset.js-variant-picker', '.product-form__input',
+            '.variant-wrapper', '.swatch-attribute', 'fieldset[class*="variant"]'
+        ];
+        
+        scope.find(shopifySelectors.join(', ')).each((_, el) => {
+            const $container = $(el);
+            let type = $container.find('legend, .form__label, .swatch-attribute-label').first().text().replace(/:/g, '').trim() || "Option";
+            
+            $container.find('input[type="radio"], input[type="checkbox"], label, .swatch-element').each((i, sub) => {
+                const $sub = $(sub);
+                let val = "";
+
+                if ($sub.is('input')) {
+                    val = $sub.val();
+                } else {
+                    val = $sub.text().trim() || $sub.attr('data-value');
+                }
+
+                // If val is a number (Shopify variant ID), try to map it using meta
+                if (val && /^\d+$/.test(val) && shopifyMap && shopifyMap[val]) {
+                    val = shopifyMap[val];
+                }
+
+                if (val && val.length < 50 && !/select|choose/i.test(val)) {
+                    if (!variants.some(v => v.value === val)) {
+                        variants.push({ type, value: val });
+                    }
+                }
+            });
+        });
 
         // 3. Dynamic Strategy C: Standard Select Dropdowns
         const standardSelectors = [
@@ -1287,10 +1878,17 @@ class SmartScraper {
                     const optText = $(opt).text().trim();
                     const optVal = $(opt).attr('value');
                     if (optText && !/select|choose/i.test(optText) && optVal) {
+                        let finalValue = optText;
+                        
+                        // Shopify fallback: Use metadata mapping for name="id" or similar Select IDs
+                        if (shopifyMap && shopifyMap[optVal] && (optText.includes(optVal) || /Variant \d+/.test(optText) || optText === optVal)) {
+                            finalValue = shopifyMap[optVal];
+                        }
+
                         const price = $(opt).attr('data-price') || null;
-                        if (price) price_map[optText] = this.toEngDigits(String(price));
-                        if (!variants.some(v => v.value === optText)) {
-                            variants.push({ type: label, value: optText, price: price });
+                        if (price) price_map[finalValue] = this.toEngDigits(String(price));
+                        if (!variants.some(v => v.value === finalValue)) {
+                            variants.push({ type: label, value: finalValue, price: price });
                         }
                     }
                 });
@@ -1303,7 +1901,7 @@ class SmartScraper {
 
 
     // 2. High-Fidelity Meta Engine (OG/Twitter)
-    async extractMetaInfo($, sourceUrl, isProductPage, shortDesc, longDesc, container) {
+    extractMetaInfo($, sourceUrl, isProductPage, shortDesc, longDesc, container) {
         if (isProductPage) {
             const metaName = $('meta[property="og:title"]').attr('content') || $('meta[name="twitter:title"]').attr('content') || $('title').text().split('|')[0].split('-')[0].trim();
             const metaImg = $('meta[property="og:image:secure_url"]').attr('content') || $('meta[property="og:image"]').attr('content') || $('meta[name="twitter:image"]').attr('content');
@@ -1311,7 +1909,6 @@ class SmartScraper {
             let metaPrice = $('meta[property="product:price:amount"]').attr('content') ||
                 $('meta[property="og:price:amount"]').attr('content');
 
-            // V6.3: Support twitter:data1 if it's labeled as "price"
             const twitterData1 = $('meta[name="twitter:data1"]').attr('content');
             const twitterLabel1 = ($('meta[name="twitter:label1"]').attr('content') || "").toLowerCase();
             if (!metaPrice && twitterData1 && (twitterLabel1.includes('price') || twitterData1.includes('৳') || twitterData1.includes('Tk'))) {
@@ -1322,7 +1919,7 @@ class SmartScraper {
 
             if (metaName && (metaPrice || metaImg)) {
                 const metaVariants = this.extractVariants($, container, sourceUrl);
-                await this.addProduct(this.normalizeProduct({
+                return {
                     name: metaName,
                     price: metaPrice || "",
                     full_description: longDesc || metaDesc || "",
@@ -1331,27 +1928,66 @@ class SmartScraper {
                     product_url: sourceUrl,
                     variants: metaVariants?.variants || [],
                     price_map: metaVariants?.price_map || {}
-                }));
+                };
             }
         }
+        return null;
     }
 
     async extractProducts($, sourceUrl) {
         const pageTitle = $('title').text().toLowerCase();
         const ogType = $('meta[property="og:type"]').attr('content');
-        const isProductPage = (ogType === 'product' || sourceUrl.includes('/product/') || sourceUrl.includes('/products/') || sourceUrl.includes('/p/'));
 
-        // Anti-Category Filters
-        const nonProductPatterns = ['/terms', '/privacy', '/news', '/blog', '/contact', '/about', '/policy', '/cart', '/checkout', '/my-account', '/collections/', '/category/', '/product-category/'];
-        if (nonProductPatterns.some(p => sourceUrl.toLowerCase().includes(p)) && !isProductPage) return;
+        // V17.0: Enterprise Non-Product URL Shield
+        const nonProductUrlPatterns = ['/category/', '/product-category/', '/collections/', '/cart', '/checkout', '/my-account', '/terms', '/privacy', '/news', '/blog', '/contact', '/about', '/policy', '/store-locator', '/page/'];
+        const urlLower = sourceUrl.toLowerCase();
+        if (nonProductUrlPatterns.some(p => urlLower.includes(p))) return;
 
-        // 1. Identify Main Product Container (Used for scoping variants and prices)
-        const productContainers = [
-            '.product-single', '.product-details', '.product-main',
-            '.product-info', '.product-summary', '.entry-summary',
-            '.product_wrapper', '.product-essential', '.product-shop'
-        ];
+        const isProductPage = (ogType === 'product' || sourceUrl.includes('/product/') || sourceUrl.includes('/products/') || sourceUrl.includes('/p/') || sourceUrl.includes('/details/'));
 
+        // Waterfall State
+        const finalProd = {
+            product_url: sourceUrl,
+            name: "",
+            sku: "",
+            price: "",
+            regular_price: "",
+            sale_price: "",
+            description: "",
+            full_description: "",
+            imageUrl: "",
+            variants: [],
+            price_map: {},
+            technical_attributes: ""
+        };
+
+        const patch = (source) => {
+            if (!source) return;
+            if (!finalProd.name && source.name) finalProd.name = source.name;
+            if (!finalProd.sku && source.sku) finalProd.sku = source.sku;
+            if (!finalProd.price && source.price) finalProd.price = source.price;
+            if (!finalProd.regular_price && source.regular_price) finalProd.regular_price = source.regular_price;
+            if (!finalProd.sale_price && source.sale_price) finalProd.sale_price = source.sale_price;
+            if (!finalProd.description && source.description) finalProd.description = source.description;
+            if (!finalProd.full_description && source.full_description) finalProd.full_description = source.full_description;
+            if (!finalProd.imageUrl && source.imageUrl) finalProd.imageUrl = source.imageUrl;
+            
+            // Variants Patching: If source has more variants, use them (likely higher fidelity)
+            if (source.variants && source.variants.length > finalProd.variants.length) {
+                finalProd.variants = source.variants;
+                finalProd.price_map = source.price_map || {};
+            }
+            
+            if (source.technical_attributes) {
+                if (!finalProd.technical_attributes) finalProd.technical_attributes = source.technical_attributes;
+                else if (!finalProd.technical_attributes.includes(source.technical_attributes)) {
+                    finalProd.technical_attributes += " | " + source.technical_attributes;
+                }
+            }
+        };
+
+        // 1. Identify Main Product Container
+        const productContainers = ['.product-single', '.product-details', '.product-main', '.product-info', '.product-summary', '.entry-summary', '.product_wrapper', '.product-essential', '.product-shop'];
         let container = null;
         for (const s of productContainers) {
             const el = $(s).first();
@@ -1363,275 +1999,385 @@ class SmartScraper {
         const $cleanBody = $.load($.html());
         $cleanBody('script, style, iframe, noscript, form, button, .variations, .woocommerce-variation-add-to-cart, .zoomContainer').remove();
 
-        const shortDescSelectors = [
-            '.product-short-description', '.summary', '.woocommerce-product-details__short-description',
-            '.short-description', '.product-excerpt', '.post-excerpt'
-        ];
-
-        const longDescSelectors = [
-            '.product-description', '#description', '.description', '[itemprop="description"]',
-            '.rte', '.woocommerce-tabs', '.product-tabs-content',
-            '.entry-content', '.fusion-text', '#tab-description', '.product-info-main',
-            '.product-details', '.additional-information', '#tab-additional_information',
-            '.pro-detail', '.product-specs', '.specification-tabs', '.tab-content'
-        ];
+        const shortDescSelectors = ['.product-short-description', '.summary', '.woocommerce-product-details__short-description', '.short-description', '.product-excerpt', '.post-excerpt'];
+        const longDescSelectors = ['.product-description', '#description', '.description', '[itemprop="description"]', '.rte', '.woocommerce-tabs', '.product-tabs-content', '.entry-content', '.fusion-text', '#tab-description', '.product-info-main', '.product-details', '.additional-information', '#tab-additional_information', '.pro-detail', '.product-specs', '.specification-tabs', '.tab-content'];
 
         const shortDescRaw = $cleanBody(shortDescSelectors.join(', ')).first().html();
-        const longDescRaw = $cleanBody(longDescSelectors.join(', ')).not(shortDescSelectors.join(', ')).first().html() ||
-            $cleanBody(longDescSelectors.join(', ')).first().html();
-
+        const longDescRaw = $cleanBody(longDescSelectors.join(', ')).not(shortDescSelectors.join(', ')).first().html() || $cleanBody(longDescSelectors.join(', ')).first().html();
         const shortDesc = this.cleanHtmlDescription(shortDescRaw);
         const longDesc = this.cleanHtmlDescription(longDescRaw);
 
-        // 3. Recursive JSON-LD Graph Engine (Deep Data)
-        const ldJsonScripts = $('script[type="application/ld+json"]').toArray();
-        for (const el of ldJsonScripts) {
-            try {
-                const json = JSON.parse($(el).html() || "");
-                const items = json['@graph'] || (Array.isArray(json) ? json : [json]);
+        // V13.1: Universal Metadata Extraction
+        const universalMetadata = this.extractUniversalMetadata($, container, (shortDescRaw || "") + (longDescRaw || ""));
+        finalProd.technical_attributes = universalMetadata.technical_attributes;
 
-                for (const item of items) {
-                    const type = item['@type'];
-                    if (type === 'Product' || type === 'http://schema.org/Product') {
-                        if (!item.name || item.name.toLowerCase().includes('category')) continue;
+        // --- ENGINE 1: NEXT.JS DATA (Highest Fidelity) ---
+        const nextData = this.extractNextData($);
+        if (nextData && isProductPage) {
+            let sailorImage = nextData.thumbnail_image || (nextData.photos && nextData.photos.length > 0 ? (nextData.photos[0].path || nextData.photos[0].image) : null);
+            if (sailorImage && !sailorImage.startsWith('http')) {
+                const urlObj = new URL(sourceUrl);
+                sailorImage = `${urlObj.protocol}//${urlObj.hostname}${sailorImage.startsWith('/') ? '' : '/'}${sailorImage}`;
+            }
 
-                        let variantData = this.extractVariants($, container, sourceUrl);
-                        let variants = variantData ? variantData.variants : [];
-                        let price_map = variantData ? variantData.price_map : {};
+            const nextProd = {
+                name: nextData.name,
+                sku: nextData.sku,
+                price: nextData.main_price || nextData.calculable_price,
+                regular_price: nextData.stroked_price || nextData.main_price,
+                sale_price: nextData.has_discount ? (nextData.main_price || nextData.calculable_price) : "",
+                description: shortDesc || (nextData.description ? this.cleanHtmlDescription(nextData.description).substring(0, 300) : ""),
+                full_description: this.cleanHtmlDescription(nextData.description) || longDesc || "",
+                imageUrl: sailorImage,
+                technical_attributes: nextData.fit ? `Fit: ${nextData.fit}` : ""
+            };
 
-                        // 4. JSON-LD Offer Sync (Dynamic Mapping)
-                        const offers = Array.isArray(item.offers) ? item.offers : (item.offers ? [item.offers] : []);
-                        if (offers.length > 1 || variants.length === 0) {
-                            for (const off of offers) {
-                                if (off['@type'] === 'Offer' || off['@type'] === 'http://schema.org/Offer') {
-                                    const vVal = off.name || off.sku || item.name;
-                                    if (off.price) price_map[vVal] = this.toEngDigits(String(off.price));
-                                    if (!variants.some(v => v.value === vVal)) {
-                                        variants.push({
-                                            type: "Option",
-                                            value: vVal,
-                                            price: off.price || off.lowPrice,
-                                            sku: off.sku
-                                        });
-                                    }
-                                }
-                            }
-                        }
-
-                        // Deep Image Search in Schema
-                        let img = item.image;
-                        if (Array.isArray(img)) img = img[0];
-                        if (typeof img === 'object') img = img.url || img.contentUrl || img.image;
-
-                        const schemaPrice = item.offers?.price || item.offers?.[0]?.price || item.offers?.lowPrice || "";
-                        let finalPrice = schemaPrice;
-
-                        // V7.0: Robust SKU extraction if JSON-LD is missing it
-                        let sku = item.sku || item.mpn || "";
-                        if (!sku) {
-                            sku = this.extractSKU($, container);
-                        }
-
-                        await this.addProduct(this.normalizeProduct({
-                            name: item.name,
-                            sku: sku,
-                            price: finalPrice,
-                            full_description: longDesc || item.description || "",
-                            description: shortDesc || "",
-                            imageUrl: img || $('meta[property="og:image"]').attr('content'),
-                            product_url: item.url || sourceUrl,
-                            variants: variants,
-                            price_map: price_map
-                        }));
-                    }
-                }
-            } catch (e) { }
+            const variantData = this.extractVariants($, container, sourceUrl);
+            if (variantData) {
+                nextProd.variants = variantData.variants;
+                nextProd.price_map = variantData.price_map;
+            }
+            patch(nextProd);
+            
+            // Waterfall Guard: If Next.js gave us Name, Price AND Variants, skip other engines
+            if (finalProd.name && finalProd.price && finalProd.variants.length > 0) {
+                console.log(`[Scraper] 🏁 High Fidelity Win: Next.js Engine extracted complete data for ${finalProd.name}`);
+                return await this.addProduct(this.normalizeProduct(finalProd));
+            }
         }
 
-        // 4. High-Fidelity Meta Engine (OG/Twitter)
-        await this.extractMetaInfo($, sourceUrl, isProductPage, shortDesc, longDesc, container);
+        // --- ENGINE 2: JSON-LD ---
+        if (!finalProd.name || !finalProd.price || finalProd.variants.length === 0) {
+            const ldJsonScripts = $('script[type="application/ld+json"]').toArray();
+            for (const el of ldJsonScripts) {
+                try {
+                    const json = JSON.parse($(el).html() || "");
+                    const items = json['@graph'] || (Array.isArray(json) ? json : [json]);
+                    for (const item of items) {
+                        const type = item['@type'];
+                        if (type === 'Product' || type === 'http://schema.org/Product') {
+                            if (!item.name || item.name.toLowerCase().includes('category')) continue;
 
-        // 5. Semantic Proximity Engine (DOM Fallback)
-        if (container) {
-            const cluster = this.extractPriceCluster($, container);
-            if (cluster.price || cluster.sale_price) {
-                const domSku = this.extractSKU($, container);
-                const domVariants = this.extractVariants($, container, sourceUrl);
-                await this.addProduct(this.normalizeProduct({
-                    name: $('meta[property="og:title"]').attr('content') || $('title').text().split('|')[0].trim(),
-                    sku: domSku,
-                    price: cluster.price || cluster.sale_price,
-                    regular_price: cluster.regular_price,
-                    sale_price: cluster.sale_price,
-                    full_description: longDesc,
-                    description: shortDesc || "",
-                    imageUrl: $('meta[property="og:image"]').attr('content'),
-                    product_url: sourceUrl,
-                    variants: domVariants?.variants || [],
-                    price_map: domVariants?.price_map || {}
-                }));
+                            const variantData = this.extractVariants($, container, sourceUrl);
+                            let variants = variantData ? variantData.variants : [];
+                            let price_map = variantData ? variantData.price_map : {};
+
+                            const offers = Array.isArray(item.offers) ? item.offers : (item.offers ? [item.offers] : []);
+                            if (offers.length > 1 || variants.length === 0) {
+                                offers.forEach((off, i) => {
+                                    let vVal = off.name || off.sku || `Option ${i+1}`;
+                                    if (off.price) price_map[vVal] = this.toEngDigits(String(off.price));
+                                    if (!variants.some(v => v.value === vVal)) {
+                                        variants.push({ type: "Option", value: vVal, price: off.price, sku: off.sku });
+                                    }
+                                });
+                            }
+
+                            let img = item.image;
+                            if (Array.isArray(img)) img = img[0];
+                            if (typeof img === 'object') img = img.url || img.contentUrl || img.image;
+
+                            const semanticData = this.intelligentSemanticMapping(item, longDescRaw, item);
+                            patch({
+                                name: item.name,
+                                sku: item.sku || item.mpn || this.extractSKU($, container),
+                                price: item.offers?.price || item.offers?.[0]?.price || item.offers?.lowPrice,
+                                description: this.cleanHtmlDescription(item.description)?.substring(0, 300),
+                                full_description: this.cleanHtmlDescription(item.description),
+                                imageUrl: img,
+                                technical_attributes: semanticData.technical_attributes,
+                                variants: variants,
+                                price_map: price_map
+                            });
+                        }
+                    }
+                } catch (e) {}
             }
+        }
+
+        // --- ENGINE 3: META INFO ---
+        if (!finalProd.name || !finalProd.price || finalProd.variants.length === 0) {
+            patch(this.extractMetaInfo($, sourceUrl, isProductPage, shortDesc, longDesc, container));
+        }
+
+        // --- ENGINE 4: DOM FALLBACK (The most expensive and noise-prone) ---
+        if (isProductPage && (!finalProd.name || !finalProd.price || finalProd.variants.length === 0)) {
+            const priceData = this.extractPriceCluster($, container);
+            const variantData = this.extractVariants($, container, sourceUrl);
+            patch({
+                name: this.extractName($, container) || pageTitle.split('-')[0].trim(),
+                sku: this.extractSKU($, container),
+                price: priceData.price,
+                regular_price: priceData.regular_price,
+                sale_price: priceData.sale_price,
+                description: shortDesc,
+                full_description: longDesc,
+                imageUrl: this.extractImage($, container),
+                variants: variantData?.variants || [],
+                price_map: variantData?.price_map || {}
+            });
+        }
+
+        // --- ENGINE 5: UNIVERSAL STRUCTURAL ANALYSIS (v21.0 Non-AI) ---
+        if (isProductPage && (!finalProd.name || !finalProd.price)) {
+            console.log(`[Scraper] 🕵️ Standard engines failed. Triggering Structural Fallback for: ${sourceUrl}`);
+            const structuralPrice = structuralAnalyzer.extractPriceProximity($, container);
+            if (structuralPrice) {
+                patch({
+                    price: structuralPrice.sale_price,
+                    regular_price: structuralPrice.regular_price,
+                    sale_price: structuralPrice.sale_price
+                });
+            }
+            
+            // If name is still missing, try to find the largest heading in the container
+            if (!finalProd.name) {
+                const largestHeading = container.find('h1, h2, .product-title, .title').first().text().trim();
+                if (largestHeading) patch({ name: largestHeading });
+            }
+        }
+
+        // FINAL PRODUCT ADDITION
+        const validation = BASELINE.policy.integrityCheck(finalProd);
+        if (validation.valid) {
+            await this.addProduct(this.normalizeProduct(finalProd));
+        } else {
+            console.warn(`[Scraper] 🛡️ Policy Guard: Product Rejected (${validation.reason}): ${sourceUrl}`);
         }
     }
 
     async addProduct(prod) {
+        // v14.0 Enterprise: Stateless Streaming Optimization
+        if (this.isStreaming) {
+            if (this.onProductCallback) {
+                await this.onProductCallback(prod);
+            }
+            return;
+        }
+
         // v3: Data Enrichment Logic
         const prodUrl = prod.product_url ? prod.product_url.split('?')[0].replace(/\/$/, "") : "";
+        const prodName = (prod.name || "").trim();
         const prodPriceNum = parseFloat(String(prod.price || "").replace(/[^0-9.]/g, ''));
 
         const existingIndex = this.data.products.findIndex(p => {
             const existingUrl = p.product_url ? p.product_url.split('?')[0].replace(/\/$/, "") : "";
-
-            // V8.7 Enterprise Deduplication: URL is the primary key. 
-            // Only fallback to name/price if NO URLs are available for either.
-            if (prodUrl && existingUrl) {
-                return prodUrl === existingUrl;
-            }
+            if (prodUrl && existingUrl) return prodUrl === existingUrl;
 
             const existingPriceNum = parseFloat(String(p.price || "").replace(/[^0-9.]/g, ''));
-            return (p.name === prod.name && Math.abs(existingPriceNum - prodPriceNum) < 1);
+            return (p.name === prodName && Math.abs(existingPriceNum - prodPriceNum) < 1);
         });
 
         if (existingIndex !== -1) {
             const existing = this.data.products[existingIndex];
 
-            // V4: Intelligent Data Reconciliation (Multi-Stream)
-            const currentVariants = existing.variants ? JSON.parse(existing.variants) : { items: [] };
-            const newVariants = prod.variants ? JSON.parse(prod.variants) : { items: [] };
+            // V9.8: Safe Data Reconciliation
+            const currentVariants = this.safeJsonParse(existing.variants, { items: [] });
+            const newVariants = this.safeJsonParse(prod.variants, { items: [] });
 
             const finalRegular = (prod.regular_price && prod.regular_price.match(/\d/)) ? prod.regular_price : existing.regular_price;
             const finalSale = (prod.sale_price && prod.sale_price.match(/\d/)) ? prod.sale_price : existing.sale_price;
 
-            // v6.3: Currency Symbol Protection (If new one has a symbol and current doesn't, it's richer)
             const hasExistingSymbol = /[৳$]|Tk|BDT/i.test(existing.price || "");
             const hasNewSymbol = /[৳$]|Tk|BDT/i.test(prod.price || "");
 
-            const isNewRicher = (newVariants.items.length > currentVariants.items.length) ||
+            // Quality Check: Is the new data higher fidelity?
+            const isNewRicher = (newVariants.items?.length > (currentVariants.items?.length || 0)) ||
                 (prod.full_description && (!existing.full_description || prod.full_description.length > (existing.full_description?.length || 0) * 1.1)) ||
                 (prod.imageUrl && typeof prod.imageUrl === 'string' && prod.imageUrl.includes('http') && !existing.imageUrl) ||
-                (prod.regular_price && !existing.regular_price) ||
                 (hasNewSymbol && !hasExistingSymbol);
 
             if (isNewRicher) {
-                // V7.3 Enterprise Persistence: Never downgrade variants
-                // We compare the actual items length to pick the 'best' variant set
-                const hasExistingVariants = currentVariants.items && currentVariants.items.length > 0;
-                const hasNewVariants = newVariants.items && newVariants.items.length > 0;
-
-                let finalVariantsObj = prod.variants; // Default to new
-                if (hasExistingVariants && !hasNewVariants) {
+                let finalVariantsObj = prod.variants;
+                if (currentVariants.items?.length > (newVariants.items?.length || 0)) {
                     finalVariantsObj = existing.variants;
-                } else if (hasExistingVariants && hasNewVariants) {
-                    // If both have variants, pick the one with more options
-                    finalVariantsObj = (newVariants.items.length >= currentVariants.items.length) ? prod.variants : existing.variants;
                 }
 
                 this.data.products[existingIndex] = {
                     ...existing,
                     ...prod,
                     name: prod.name || existing.name,
-                    sku: prod.sku || existing.sku,
-                    price: prod.price || existing.price,
-                    imageUrl: prod.imageUrl || existing.imageUrl,
-                    variants: finalVariantsObj,
+                    description: prod.description || existing.description,
+                    variants: this.safeJsonStringify(finalVariantsObj),
                     regular_price: finalRegular,
                     sale_price: finalSale,
                     full_description: (prod.full_description && prod.full_description.length > (existing.full_description?.length || 0)) ? prod.full_description : existing.full_description,
-                    price_map: (Object.keys(newVariants.price_map || {}).length >= Object.keys(currentVariants.price_map || {}).length) ? (prod.price_map || existing.price_map) : existing.price_map
+                    composition: prod.composition || prod.materials || existing.composition || existing.materials,
+                    handling_guidelines: prod.handling_guidelines || prod.wash_instructions || existing.handling_guidelines || existing.wash_instructions,
+                    technical_attributes: prod.technical_attributes || prod.specifications || existing.technical_attributes || existing.specifications
                 };
+
+                // Trigger callback so that the DB persister knows the product got an upgrade (e.g. description fetched from DOM)
+                if (this.onProductCallback) {
+                    await this.onProductCallback(this.data.products[existingIndex]);
+                }
             }
             return;
         }
 
         // Final sanity check for variants
-        let finalVariants = prod.variants;
-        if (typeof finalVariants === 'undefined') {
-            finalVariants = JSON.stringify({ items: [], price_map: {}, sizes: [], colors: [] });
-        }
+        const validatedVariants = this.safeJsonStringify(prod.variants || { items: [], price_map: {}, sizes: [], colors: [] });
+        const v = this.safeJsonParse(validatedVariants);
 
-        const v = JSON.parse(finalVariants);
         if (v.items && v.items.length > 0) {
             console.log(`[Scraper] 📦 Variation detected: ${prod.name} (${v.items.length} options)`);
         }
 
-        this.data.products.push({
+        const newProduct = {
             ...prod,
-            variants: finalVariants
-        });
+            variants: validatedVariants
+        };
+        this.data.products.push(newProduct);
 
         if (this.onProductCallback) {
-            await this.onProductCallback(this.data.products[this.data.products.length - 1]);
+            await this.onProductCallback(newProduct);
         }
     }
 
     discoverLinks($, currentUrl) {
-        // v8.0 Density Check: Identify "Dense" product hubs (like Magento/Large E-com categories)
+        // v21.0: Universal Structural Discovery (Non-AI)
+        // Analyzes the visual structure to find product clusters even on unknown platforms
+        try {
+            const clusters = structuralAnalyzer.findProductClusters($);
+            if (clusters.length > 0) {
+                console.log(`[Scraper] 🕵️ Structural Analyzer found ${clusters.length} potential product clusters on: ${currentUrl}`);
+                clusters.forEach(cluster => {
+                    cluster.elements.forEach(el => {
+                        const $item = $(el);
+                        // Find all links in this cluster element
+                        $item.find('a').each((_, a) => {
+                            const href = $(a).attr('href');
+                            if (href) {
+                                // Add to queue with high priority as it's structurally confirmed as a product listing
+                                this.processAndQueueUrl(href, currentUrl, 95, 'product');
+                            }
+                        });
+                    });
+                });
+            }
+        } catch (e) {
+            console.error(`[Scraper] ❌ Structural Discovery Error: ${e.message}`);
+        }
+
         const productHubSelectors = [
             '.product-item', '.item.product-item-info', '.product-image-container',
-            '.products.grid', '.products.list', '.product-block', '.product-inner'
+            '.products.grid', '.products.list', '.product-block', '.product-inner',
+            '.next-product', '.product-card', '.product-single'
         ];
         const productDensity = productHubSelectors.reduce((acc, sel) => acc + $(sel).length, 0);
 
         $('a').each((_, el) => {
             const href = $(el).attr('href');
-            if (!href || href.startsWith('javascript') || href.startsWith('#')) return;
+            const text = $(el).text().toLowerCase();
+            
+            // Heuristic boost for links with prominent product-related text
+            let priority = null;
+            let type = null;
+            
+            if (text.includes('next') || text.includes('page') || /^\d+$/.test(text.trim())) {
+                priority = 95;
+                type = 'pagination';
+            } else if (text.includes('shipping') || text.includes('delivery')) {
+                priority = 15;
+                type = 'shipping';
+            } else if (productDensity > 3) {
+                // If the page has high product density, general links might be categories
+                priority = 80;
+                type = 'category';
+            }
 
-            try {
-                const urlObj = new URL(href, currentUrl);
-                const fullUrl = this.normalizeUrl(urlObj.href);
+            this.processAndQueueUrl(href, currentUrl, priority, type);
+        });
+    }
 
-                // Lock to domain
-                if (urlObj.hostname !== this.domain && !urlObj.hostname.endsWith('.' + this.domain)) return;
+    processAndQueueUrl(href, currentUrl, forcedPriority = null, forcedType = null) {
+        if (!href || href.startsWith('javascript') || href.startsWith('#')) return;
 
-                // Skip utility pages
-                const skipPatterns = [
-                    '/cart', '/checkout', '/my-account', '/login', '/logout', '/register', 'add-to-cart',
-                    '/terms', '/privacy', '/news', '/blog', '/contact', '/about', '/policy', '/refund',
-                    '/shipping', '/return', '/wishlist', '/compare', '/order-tracking'
-                ];
-                if (skipPatterns.some(p => fullUrl.includes(p))) return;
+        try {
+            const urlObj = new URL(href, currentUrl);
+            const fullUrl = this.normalizeUrl(urlObj.href);
 
-                // Skip binary/media files
-                const mediaExtensions = [
-                    '.mp4', '.mp3', '.wav', '.zip', '.pdf', '.jpg', '.jpeg', '.png', '.gif',
-                    '.exe', '.dmg', '.pkg', '.apk', '.rar', '.7z'
-                ];
-                if (mediaExtensions.some(ext => fullUrl.toLowerCase().endsWith(ext))) return;
+            if (urlObj.hostname !== this.domain && !urlObj.hostname.endsWith('.' + this.domain)) return;
 
-                if (this.visited.has(fullUrl) || this.queue.some(q => q.url === fullUrl)) return;
+            const skipPatterns = [
+                '/cart', '/checkout', '/my-account', '/login', '/logout', '/register', 'add-to-cart',
+                '/terms', '/privacy', '/news', '/blog', '/contact', '/about', '/policy', '/refund',
+                '/shipping', '/return', '/wishlist', '/compare', '/order-tracking'
+            ];
+            if (skipPatterns.some(p => fullUrl.includes(p))) return;
 
-                const text = $(el).text().toLowerCase();
-                let priority = 10;
-                let type = 'general';
+            const mediaExtensions = ['.mp4', '.mp3', '.wav', '.zip', '.pdf', '.jpg', '.jpeg', '.png', '.gif', '.exe', '.rar'];
+            if (mediaExtensions.some(ext => fullUrl.toLowerCase().endsWith(ext))) return;
 
-                // v8.0 Enterprise Selector Priority
-                const isProductUrl = fullUrl.includes('/product/') || fullUrl.includes('/products/') || fullUrl.includes('/item/') || fullUrl.includes('/p/') || fullUrl.includes('/product-detail/');
-                const isCategoryUrl = fullUrl.includes('/collections/') || fullUrl.includes('/category/') || fullUrl.includes('/catalogue/') || fullUrl.endsWith('.html');
+            if (this.visited.has(fullUrl)) return;
+            if (this.queue.some(q => q.url === fullUrl)) return;
+
+            let priority = forcedPriority || 5;
+            let type = forcedType || 'general';
+
+            if (!forcedPriority) {
+                const isProductUrl = fullUrl.includes('/product/') || fullUrl.includes('/products/') || fullUrl.includes('/item/') || fullUrl.includes('/p/') || fullUrl.includes('/details/');
+                const isCategoryUrl = fullUrl.includes('/collections/') || fullUrl.includes('/category/') || fullUrl.includes('/catalogue/') || fullUrl.includes('/shop/');
 
                 if (isProductUrl) {
                     priority = 100;
                     type = 'product';
-                } else if (text.includes('product') || text.includes('shop') || text.includes('item')) {
-                    priority = 90;
-                    type = 'product';
-                } else if (isCategoryUrl || productDensity > 5) {
-                    // v8.0 If we are on a dense page, give high priority to all found links as they are likely sub-categories or products
-                    priority = productDensity > 5 ? 70 : 50;
+                } else if (isCategoryUrl) {
+                    priority = 80;
                     type = 'category';
-                } else if (text.includes('shipping') || text.includes('delivery')) {
-                    priority = 30;
-                    type = 'shipping';
-                } else if (text.includes('return') || text.includes('refund') || text.includes('policy')) {
-                    priority = 25;
-                    type = 'policy';
-                } else if (text.includes('contact') || text.includes('about')) {
-                    priority = 20;
-                    type = 'contact';
                 }
+            }
 
-                this.queue.push({ url: fullUrl, priority, type });
-            } catch (e) { }
-        });
+            // Global discovery suppression if we have enough products
+            if (this.data.products.length > 50 && type === 'general' && priority < 10) return;
+
+            this.queue.push({ url: fullUrl, priority, type });
+        } catch (e) { }
+    }
+    /**
+     * V13.1: Universal Metadata Hub
+     * Pillar B: Differential Extraction Logic
+     * Metadata = ProductArea - Description - UI Noise
+     */
+    extractUniversalMetadata($, container, descriptionHtml) {
+        if (!container || container.length === 0) return { technical_attributes: "", composition: "", handling_guidelines: "" };
+
+        try {
+            // Clone container to avoid mutating the main DOM
+            const $meta = $.load(container.html());
+            const metaBody = $meta('body');
+
+            // 1. Remove UI Noise (Buttons, Socials, Forms, etc.)
+            metaBody.find('button, form, .social-sharing, .product-share, .add-to-cart, .qty, .quantity, .product-form, script, style, .zoomContainer').remove();
+
+            // 2. Exact Description Pruning (Pillar A)
+            if (descriptionHtml) {
+                const descText = this.cleanHtmlDescription(descriptionHtml);
+                if (descText.length > 50) {
+                    metaBody.find('*').each((i, el) => {
+                        const $el = $(el);
+                        const text = $el.text().trim();
+                        if (text && text.length > 50 && descText.includes(text) && text.length > descText.length * 0.8) {
+                            $el.remove();
+                        }
+                    });
+                }
+            }
+
+            // 3. Clean and return the remaining text as catch-all metadata
+            let rawText = metaBody.text()
+                .replace(/\s+/g, ' ')
+                .replace(/\n+/g, '\n')
+                .trim();
+
+            const semantic = this.intelligentSemanticMapping({ full_description: rawText }, rawText, null);
+
+            return {
+                technical_attributes: semantic.technical_attributes || rawText.substring(0, 500)
+            };
+        } catch (e) {
+            return { technical_attributes: "" };
+        }
     }
 }
 

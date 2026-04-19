@@ -27,6 +27,7 @@ function cosineSimilarity(vecA, vecB) {
 class VectorService {
     constructor() {
         this.model = genAI.getGenerativeModel({ model: EMBEDDING_MODEL });
+        this.isSyncing = false; // 🔒 STRICT LOCK: Prevents any concurrent or accidental auto-vectorization
     }
 
     async generateEmbedding(text) {
@@ -95,27 +96,53 @@ class VectorService {
     // --- Manual Sync Methods ---
 
     async syncProductsEmbeddings(onLog = null) {
+        // 🔒 STRICT GUARD: Prevent concurrent or accidental auto-vectorization
+        if (this.isSyncing) {
+            const msg = '⚠️ [GUARD] Vector sync already in progress. Ignoring duplicate/auto call.';
+            console.warn(msg);
+            if (onLog) onLog(msg, 'warning');
+            return 0;
+        }
+
+        this.isSyncing = true;
         const log = (msg, type = 'info') => {
             console.log(msg);
             if (onLog) onLog(msg, type);
         };
 
-        log("🔄 Manual Product Vector Sync Started...");
-        const products = await dbUtils.getAIProducts({ limit: 10000 });
-        let updated = 0;
+        // 🔍 TRACE: Log a stack trace snippet so we always know WHO triggered this
+        const stack = new Error().stack?.split('\n').slice(2, 5).join(' -> ') || 'unknown';
+        console.log(`[VectorService] 🚨 syncProductsEmbeddings TRIGGERED. Caller trace: ${stack}`);
 
-        for (const product of products) {
-            const text = this.getProductText(product);
-            const emb = await this.generateEmbedding(text);
-            if (emb && emb.length > 0) {
-                await dbUtils.updateAIProduct(product.id, { embedding: JSON.stringify(emb) });
-                updated++;
-                log(`⚡ Vectorized: ${product.name}`, 'success');
+        try {
+            log("🔄 Manual Product Vector Sync Started (Pending Only)...");
+            // Production-Grade: We only sync what's needed to save API costs and time
+            const products = await dbUtils.getAIProducts({ limit: 10000 });
+            const pendingProducts = products.filter(p => !p.embedding || p.embedding === 'null' || p.embedding === '[]' || p.embedding === '');
+            
+            if (pendingProducts.length === 0) {
+                log("✅ No pending products found. Everything is up to date.", 'success');
+                return 0;
             }
-        }
 
-        log(`✅ Product Sync Complete. Updated ${updated} items.`, 'success');
-        return updated;
+            log(`📦 Found ${pendingProducts.length} pending products. Processing...`);
+
+            let updated = 0;
+            for (const product of pendingProducts) {
+                const text = this.getProductText(product);
+                const emb = await this.generateEmbedding(text);
+                if (emb && emb.length > 0) {
+                    await dbUtils.updateAIProduct(product.id, { embedding: JSON.stringify(emb) });
+                    updated++;
+                    log(`⚡ Vectorized [${updated}/${pendingProducts.length}]: ${product.name}`, 'success');
+                }
+            }
+
+            log(`✅ Product Sync Complete. Updated ${updated} items.`, 'success');
+            return updated;
+        } finally {
+            this.isSyncing = false; // Always release the lock
+        }
     }
 
     async syncProfileEmbedding(onLog = null) {
@@ -172,32 +199,43 @@ class VectorService {
     // --- Unified Search & Context ---
 
     async getUnifiedContext(query, limit = 5) {
-        const products = await this.semanticSearchProducts(query, 3);
-        const knowledge = await this.semanticSearchKnowledge(query, 2);
-        const profile = await dbUtils.getBusinessProfile(); // Profile is small, check it specifically if needed
+        const queryLower = query.toLowerCase();
+        
+        // 1. Intent Detection (Crude but Highly Effective)
+        const isProductInquiry = /(কত|koto|how much|price|দাম|আছে|ache|available|order|অর্ডার)/i.test(queryLower);
+        const isPolicyInquiry = /(delivery|shipping|return|refund|exchange|ফেরত|ডেলিভারি|পলিসি|policy|location|address|ঠিকানা|কোথায়)/i.test(queryLower);
+
+        // 2. Adjust Limits Based on Intent
+        const pLimit = isProductInquiry ? 4 : (isPolicyInquiry ? 1 : 2);
+        const kLimit = isPolicyInquiry ? 4 : (isProductInquiry ? 1 : 2);
+
+        const products = await this.semanticSearchProducts(query, pLimit);
+        const knowledge = await this.semanticSearchKnowledge(query, kLimit);
+        const profile = await dbUtils.getBusinessProfile();
 
         let context = "";
 
+        // Profile Context (Always helpful if relevant)
         if (profile.embedding) {
             const queryEmb = await this.generateEmbedding(query);
             const profEmb = JSON.parse(profile.embedding);
             const sim = cosineSimilarity(queryEmb, profEmb);
             if (sim > 0.4) {
-                context += `BUSINESS INFO:\n${this.getProfileText(profile)}\n\n`;
+                context += `[OFFICIAL BUSINESS INFO]:\n${this.getProfileText(profile)}\n\n`;
             }
         }
 
         if (products.length > 0) {
-            context += "RELEVANT PRODUCTS:\n";
-            context += products.map(p => `- ${p.name} (${p.price}): ${this.purifyText(p.full_description || p.description)}`).join("\n") + "\n\n";
+            context += "[RELEVANT PRODUCTS]:\n";
+            context += products.map(p => `- ${p.name} (Price: ${p.price}): ${this.purifyText(p.full_description || p.description)}`).join("\n") + "\n\n";
         }
 
         if (knowledge.length > 0) {
-            context += "POLICIES & FAQ:\n";
+            context += "[BUSINESS POLICIES & FAQ]:\n";
             context += knowledge.map(k => `- ${k.title}: ${this.purifyText(k.content)}`).join("\n") + "\n\n";
         }
 
-        return context || "No specific context found.";
+        return context || "No specific business documents matched. Use general professional knowledge if applicable or trigger handover.";
     }
 
     // Performs semantic similarity search against the DB

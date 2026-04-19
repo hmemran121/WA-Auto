@@ -163,6 +163,7 @@ const ChatBox: React.FC<ChatBoxProps> = ({ logs, contacts, onSendMessage, onSend
     /* activeButtons state removed */
     const [loadingHistory, setLoadingHistory] = useState(false);
     const [hasMoreHistory, setHasMoreHistory] = useState(true);
+    const [aiStatus, setAiStatus] = useState({ ai_paused: 0, handover_requested: 0 });
     const scrollRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const recordingInterval = useRef<any>(null);
@@ -259,7 +260,54 @@ const ChatBox: React.FC<ChatBoxProps> = ({ logs, contacts, onSendMessage, onSend
         setHasMoreHistory(true);
         recentFetchIdRef.current = null;
         scrollAnchoringRef.current = null;
+        
+        // Fetch AI Status for the selected customer
+        if (selectedChat) {
+            fetchAIStatus(selectedChat);
+        } else {
+            setAiStatus({ ai_paused: 0, handover_requested: 0 });
+        }
     }, [selectedChat]);
+
+    const fetchAIStatus = async (number: string) => {
+        try {
+            const res = await fetch(`http://localhost:3001/api/customers/ai-status/${encodeURIComponent(number)}`);
+            const data = await res.json();
+            if (data.success) {
+                setAiStatus(data.status);
+            }
+        } catch (err) {
+            console.error('Failed to fetch AI status:', err);
+        }
+    };
+
+    const toggleAI = async () => {
+        if (!selectedChat) return;
+        const newStatus = { 
+            ai_paused: aiStatus.ai_paused === 1 ? 0 : 1, 
+            handover_requested: 0 // Reset handover when manually toggling
+        };
+        
+        try {
+            // Optimistic Update
+            setAiStatus(prev => ({ ...prev, ...newStatus }));
+            
+            const res = await fetch('http://localhost:3001/api/customers/toggle-ai', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    number: selectedChat,
+                    ...newStatus
+                })
+            });
+            const data = await res.json();
+            if (!data.success) throw new Error(data.error);
+        } catch (err) {
+            console.error('Failed to toggle AI:', err);
+            // Revert on error
+            fetchAIStatus(selectedChat);
+        }
+    };
 
     // Auto-fetch: if a chat is selected but has no messages, trigger initial history load
     useEffect(() => {
@@ -406,9 +454,23 @@ const ChatBox: React.FC<ChatBoxProps> = ({ logs, contacts, onSendMessage, onSend
         socket.on('history_loaded', handleHistoryLoaded);
         socket.on('history_error', handleHistoryError);
 
+        socket.on('handover_alert', (data: { number: string, name: string }) => {
+            if (data.number === selectedChat) {
+                setAiStatus(prev => ({ ...prev, handover_requested: 1 }));
+            }
+            showAlert({
+                type: 'warning',
+                title: 'AI Handover Requested',
+                message: `${data.name || data.number} needs human intervention.`,
+                autoDismiss: true,
+                dismissAfter: 5000
+            });
+        });
+
         return () => {
             socket.off('history_loaded', handleHistoryLoaded);
             socket.off('history_error', handleHistoryError);
+            socket.off('handover_alert');
         };
     }, [selectedChat, socket]);
 
@@ -800,11 +862,39 @@ const ChatBox: React.FC<ChatBoxProps> = ({ logs, contacts, onSendMessage, onSend
                                     </div>
                                 </div>
                             </div>
-                            <div className="flex items-center gap-3 text-wa-teal">
-                                <button className="p-2.5 hover:bg-wa-light rounded-full transition-all duration-200">
+                            <div className="flex items-center gap-3">
+                                {/* Smart AI Toggle */}
+                                <div className="relative group">
+                                    <button
+                                        onClick={toggleAI}
+                                        className={`p-2.5 rounded-full transition-all duration-300 relative flex items-center justify-center ${aiStatus.ai_paused === 0
+                                            ? 'bg-purple-50 text-purple-600 hover:bg-purple-100'
+                                            : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                                            }`}
+                                        title={aiStatus.ai_paused === 0 ? 'AI Auto-Reply is ON (Click to Pause)' : 'AI Auto-Reply is PAUSED (Click to Resume)'}
+                                    >
+                                        <Zap size={20} className={aiStatus.ai_paused === 0 ? 'fill-current' : ''} />
+                                        
+                                        {/* Handover Pulse indicator */}
+                                        {aiStatus.handover_requested === 1 && (
+                                            <span className="absolute inset-0 rounded-full border-2 border-rose-500 animate-ping opacity-75"></span>
+                                        )}
+                                        {aiStatus.handover_requested === 1 && (
+                                            <span className="absolute -top-1 -right-1 w-3 h-3 bg-rose-500 rounded-full border-2 border-white"></span>
+                                        )}
+                                    </button>
+                                    
+                                    {/* Tooltip hint */}
+                                    <div className="absolute top-full right-0 mt-2 p-2 bg-gray-900 text-white text-[10px] font-bold rounded shadow-lg whitespace-nowrap opacity-0 group-hover:opacity-100 pointer-events-none transition-opacity z-50">
+                                        {aiStatus.ai_paused === 0 ? 'AI ACTIVE' : 'AI PAUSED (MANUAL MODE)'}
+                                        {aiStatus.handover_requested === 1 && ' • HANDOVER REQUESTED'}
+                                    </div>
+                                </div>
+
+                                <button className="p-2.5 hover:bg-wa-light rounded-full transition-all duration-200 text-wa-teal">
                                     <Video size={20} />
                                 </button>
-                                <button className="p-2.5 hover:bg-wa-light rounded-full transition-all duration-200">
+                                <button className="p-2.5 hover:bg-wa-light rounded-full transition-all duration-200 text-wa-teal">
                                     <Phone size={20} />
                                 </button>
                                 <div className="h-6 w-[1px] bg-gray-200 mx-1"></div>

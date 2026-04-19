@@ -3,6 +3,7 @@ const { io } = require('socket.io-client');
 const qrcode = require('qrcode');
 const path = require('path');
 const fs = require('fs');
+const { execSync } = require('child_process');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
 const ffprobePath = require('ffprobe-static').path;
@@ -48,17 +49,211 @@ const client = new Client({
             '--no-zygote',
             '--disable-gpu',
             '--disable-extensions',
-            '--shm-size=1gb'
+            '--disable-background-networking',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-breakpad',
+            '--disable-component-update',
+            '--disable-domain-reliability',
+            '--disable-sync',
+            '--shm-size=1gb',
+            // Added for stability and injection reliability
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         ]
     }
 });
 
+/**
+ * PRODUCTION-GRADE: Ensures no orphan browser processes or stale lock files
+ * are blocking the initialization.
+ */
+const ensureBrowserCleanState = async () => {
+    console.log('[WA-Service] Running pre-init cleanup...');
+
+    // Windows Specific: Kill orphan processes holding the session profile
+    if (process.platform === 'win32') {
+        try {
+            console.log('[WA-Service] 🧹 Checking for orphan browser processes association...');
+            // PRODUCTION-GRADE: Target processes that have our session path in their command line to release directory handles
+            // We use a more robust powershell command to find and kill processes
+            const psCmd = `powershell -Command "Get-CimInstance Win32_Process -Filter \\"Name LIKE '%chrome%' OR Name LIKE '%chromium%'\\" | Where-Object { $_.CommandLine -like '*session-wa-auto-client*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"`;
+            execSync(psCmd, { stdio: 'ignore' });
+            // Small pause to let OS release file handles
+            await new Promise(r => setTimeout(r, 2000));
+        } catch (e) {
+            // Often errors if no matching process is found, which is fine
+        }
+    }
+
+    const sessionPath = path.join(__dirname, '.wwebjs_auth', 'session-wa-auto-client');
+    const lockFiles = [
+        path.join(sessionPath, 'SingletonLock'),
+        path.join(sessionPath, 'SingletonSocket'),
+        path.join(sessionPath, 'SingletonCookie'),
+        path.join(sessionPath, 'DevToolsActivePort'),
+        path.join(sessionPath, 'Default', 'SingletonLock'),
+        path.join(sessionPath, 'Default', 'SingletonSocket'),
+        path.join(sessionPath, 'Default', 'SingletonCookie'),
+        path.join(sessionPath, 'Default', 'DevToolsActivePort')
+    ];
+
+    lockFiles.forEach(lockPath => {
+        try {
+            if (fs.existsSync(lockPath)) {
+                console.log(`[WA-Service] 🧹 Removing stale lock file: ${lockPath}`);
+                fs.unlinkSync(lockPath);
+            }
+        } catch (e) {
+            console.warn(`[WA-Service] Failed to remove lock ${lockPath}:`, e.message);
+        }
+    });
+
+    // Check if the directory is still locked by trying to rename/access it
+    // This is an extra safety layer for enterprise-grade robustness
+    try {
+        const testFile = path.join(sessionPath, '.lock_test');
+        fs.writeFileSync(testFile, 'lock_check');
+        fs.unlinkSync(testFile);
+    } catch (e) {
+        console.warn('[WA-Service] ⚠️ Session directory might still be locked by another process.');
+    }
+};
+
+const robustInitialize = async (retryCount = 0) => {
+    if (isInitializing && retryCount === 0) {
+        console.warn(`[WA-Service] ⚠️ Initialization SKIP: isInitializing=${isInitializing}, state=${lastState.state}`);
+        return;
+    }
+
+    isInitializing = true;
+    updateState('initial');
+
+    try {
+        // PRODUCTION-GRADE: Proactive Memory Management Pulse
+        if (global.gc) {
+            setInterval(() => {
+                const startMem = Math.round(process.memoryUsage().rss / 1024 / 1024);
+                global.gc();
+                const endMem = Math.round(process.memoryUsage().rss / 1024 / 1024);
+                console.log(`[WA-Pulse] 🧠 RAM Cleared: ${startMem}MB -> ${endMem}MB`);
+            }, 1000 * 60 * 60); // Every hour
+        }
+
+        console.log(`[WA-Service] Initializing client (Attempt ${retryCount + 1})...`);
+        
+        // Ensure clean state before start
+        await ensureBrowserCleanState();
+        
+        await client.initialize();
+        
+        // Success: State will be updated by 'ready' event
+    } catch (err) {
+        console.error(`[WA-Service] Init error (Attempt ${retryCount + 1}):`, err.message);
+        
+        let errorMessage = err.message;
+
+        // Handle browser already running
+        if (err.message.includes('browser is already running') || 
+            err.message.includes('userDataDir') ||
+            err.message.includes('SingletonLock')) {
+            console.error('[WA-Service] 🚨 FATAL: Browser lock persistence detected.');
+            errorMessage = "Browser session is locked by another process. Retrying cleanup...";
+            
+            if (retryCount < 2) {
+                console.log('[WA-Service] Retrying with aggressive cleanup...');
+                await ensureBrowserCleanState();
+                await new Promise(r => setTimeout(r, 3000)); // Delay for handles to release
+                return robustInitialize(retryCount + 1);
+            }
+        }
+
+        // Handle specific injection failure or "Target closed"
+        if (err.message.includes('Execution context was destroyed') || 
+            err.message.includes('navigation') || 
+            err.message.includes('Target closed') ||
+            err.message.includes('Protocol error')) {
+            
+            errorMessage = "Communication error with browser (Target closed). Retrying...";
+            if (retryCount < 3) {
+                const delay = (retryCount + 1) * 3000; // Increased delay
+                console.log(`[WA-Service] ⚠️ Critical communication failure. Retrying in ${delay}ms...`);
+                await new Promise(r => setTimeout(r, delay));
+                return robustInitialize(retryCount + 1);
+            }
+        }
+
+        updateState('error', errorMessage);
+    }
+};
+
+// Global Error Shields
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[WA-Service] 🚨 Unhandled Rejection:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('[WA-Service] 🚨 Uncaught Exception:', err.message);
+    // Optional: Graceful restart logic could go here
+});
+
+
 let lastState = { state: 'initial', data: null };
+let initAttempts = 0;
+let isInitializing = false;
+const MAX_INIT_ATTEMPTS = 3;
 
 const updateState = (state, data = null) => {
-    lastState = { state, data };
+    // If state is 'ready', try to bundle account info if it was already fetched
+    const payload = { state, data };
+    if (state === 'ready' && client.info) {
+        payload.accountInfo = {
+            wid: client.info.wid._serialized,
+            number: client.info.wid.user,
+            name: client.info.pushname,
+            platform: client.info.platform
+        };
+    }
+
+    lastState = payload;
+    if (state === 'ready' || state === 'authenticated' || state === 'error') {
+        isInitializing = false;
+        if (state === 'ready') initAttempts = 0;
+    }
     socket.emit('service_status_update', lastState);
 };
+
+// Health Check and Auto-Recovery (Enterprise Memory Guard)
+setInterval(() => {
+    // 1. Connection Recovery
+    if (lastState.state === 'initial' && !isInitializing && initAttempts < MAX_INIT_ATTEMPTS) {
+        const sessionExists = fs.existsSync(path.join(__dirname, '.wwebjs_auth', 'session-wa-auto-client'));
+        if (sessionExists) {
+            console.log('[WA-Service] Health Check: Client is "initial" but session exists. Attempting auto-init...');
+            initAttempts++;
+            robustInitialize().catch(err => {
+                console.error('[WA-Service] Auto-init failed:', err.message);
+            });
+        }
+    }
+
+    // 2. Memory Shield
+    const rss = process.memoryUsage().rss / 1024 / 1024;
+    const RAM_LIMIT = parseInt(process.env.MAX_BROWSER_RAM_MB) || 1200;
+    if (rss > RAM_LIMIT) { 
+        console.log(`[WA-Service] 🛡️ Memory Guard: RSS is ${Math.round(rss)}MB. Limit: ${RAM_LIMIT}MB. Pulsing Garbage Collection...`);
+        if (global.gc) {
+            global.gc();
+            const afterGc = process.memoryUsage().rss / 1024 / 1024;
+            console.log(`[WA-Service] 🛡️ Memory Guard: RSS after GC is ${Math.round(afterGc)}MB.`);
+            
+            // Critical Recovery: If memory is still extremely high (> 2X limit), log a critical warning
+            if (afterGc > RAM_LIMIT * 2) {
+                console.warn('[WA-Service] 🚨 CRITICAL: Persistent High Memory detected. Consider manual service_restart.');
+            }
+        }
+    }
+}, 60000); // Check every 60 seconds (optimized for long-running)
 
 // Audio conversion utility (WEBM -> OGG Opus)
 const convertAudioToOgg = (inputPath) => {
@@ -105,12 +300,33 @@ client.on('qr', async (qr) => {
         updateState('qr', url);
     } catch (err) {
         console.error('[WA-Service] QR Error:', err);
+        updateState('error', 'Critical Error: Failed to generate QR code image.');
     }
 });
 
-client.on('ready', () => {
+client.on('ready', async () => {
     console.log('[WA-Service] READY');
-    updateState('ready');
+    isInitializing = false;
+    initAttempts = 0; // Reset attempts on success
+    
+    // Professional Metadata Sync
+    let accountInfo = null;
+    try {
+        if (client.info) {
+            accountInfo = {
+                wid: client.info.wid._serialized,
+                number: client.info.wid.user,
+                name: client.info.pushname,
+                platform: client.info.platform
+            };
+            console.log(`[WA-Service] Account Info: ${accountInfo.name} (${accountInfo.number}) on ${accountInfo.platform}`);
+            socket.emit('service_account_info', accountInfo);
+        }
+    } catch (e) {
+        console.error('[WA-Service] Error fetching account info:', e.message);
+    }
+
+    updateState('ready', accountInfo);
 });
 
 client.on('authenticated', () => {
@@ -120,7 +336,7 @@ client.on('authenticated', () => {
 
 client.on('auth_failure', (msg) => {
     console.error('[WA-Service] AUTH FAILURE', msg);
-    updateState('auth_failure', msg);
+    updateState('error', `Authentication Failed: ${msg}`);
 });
 
 client.on('message', async (msg) => {
@@ -206,7 +422,7 @@ client.on('message_ack', (msg, ack) => {
 
 client.on('disconnected', (reason) => {
     console.log('[WA-Service] Disconnected:', reason);
-    updateState('initial');
+    updateState('error', `Disconnected: ${reason}`);
 });
 
 // Helper to delete folder recursively (for session clearing)
@@ -226,6 +442,11 @@ const deleteFolderRecursive = (folderPath) => {
 
 socket.on('service_restart', async (data = {}) => {
     console.log('[WA-Service] Restarting client... Clear Session:', data.clearSession);
+    
+    // Reset initialization state on manual restart to prevent race-condition skips
+    isInitializing = false;
+    initAttempts = 0;
+    
     updateState('initial');
     try {
         await client.destroy();
@@ -235,6 +456,12 @@ socket.on('service_restart', async (data = {}) => {
             const sessionPath = path.join(__dirname, '.wwebjs_auth', 'session-wa-auto-client');
             console.log(`[WA-Service] Clearing session data at: ${sessionPath}`);
             try {
+                // Ensure browser is dead before deleting files
+                if (process.platform === 'win32') {
+                    const psCmd = `powershell -Command "Get-CimInstance Win32_Process -Filter \\"CommandLine LIKE '%session-wa-auto-client%\\'\\" | Stop-Process -Force erroraction silentlycontinue"`;
+                    execSync(psCmd, { stdio: 'ignore' });
+                    await new Promise(r => setTimeout(r, 1000));
+                }
                 deleteFolderRecursive(sessionPath);
                 console.log('[WA-Service] Session data cleared successfully.');
             } catch (err) {
@@ -244,8 +471,12 @@ socket.on('service_restart', async (data = {}) => {
     } catch (e) {
         console.error('[WA-Service] Error during client destroy/restart:', e.message);
     }
+    
+    // Safety delay before re-init
+    await new Promise(r => setTimeout(r, 2000));
+    
     console.log('[WA-Service] Reinitializing client...');
-    client.initialize().catch(err => console.error('[WA-Service] Init error:', err));
+    robustInitialize().catch(err => console.error('[WA-Service] Init error:', err));
 });
 
 socket.on('service_send_message', async (data) => {
@@ -555,6 +786,10 @@ socket.on('service_send_message', async (data) => {
                 if (i < attachments.length - 1) {
                     await new Promise(r => setTimeout(r, 800));
                 }
+
+                // Production-Grade Buffer Cleanup
+                mediaObject = null;
+                if (global.gc) global.gc();
             } // end loop
 
             // If NO valid attachments were successfully sent, OR if the main text wasn't consumed as a caption, send it standalone
@@ -572,6 +807,7 @@ socket.on('service_send_message', async (data) => {
                     notifyName,
                     originalData: { ...data, mediaUrl: null, mediaType: null, attachments: [] }
                 });
+                textMsg = null; // Explicit cleanup
             }
 
             // Scheduler ACK - Emit ONCE after the entire batch (attachments + text) is done
@@ -606,10 +842,10 @@ socket.on('service_send_message', async (data) => {
         console.error('[WA-PRO] FATAL SEND ERROR:', err.message);
 
         // DYNAMIC RECOVERY: If frame is detached, the browser session is dead.
-        if (err.message.includes('detached Frame')) {
-            console.error('[WA-PRO] ⚠️ CRITICAL: Detached Frame detected. Client session is unstable.');
+        if (err.message.includes('detached Frame') || err.message.includes('Session closed')) {
+            console.error('[WA-PRO] ⚠️ CRITICAL: Browser session error. Resetting for auto-recovery...');
             updateState('initial');
-            socket.emit('service_status_update', { state: 'initial', error: 'Browser Frame Detached - Please Restart' });
+            socket.emit('service_status_update', { state: 'initial', error: 'Browser Session Error - Recovering...' });
         }
 
         socket.emit('service_message_result', {
@@ -850,4 +1086,4 @@ socket.on('service_delete_message', async (data) => {
     }
 });
 
-client.initialize().catch(err => console.error('[WA-Service] Init error:', err));
+robustInitialize().catch(err => console.error('[WA-Service] TOP-LEVEL Init error:', err));

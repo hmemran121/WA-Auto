@@ -2,33 +2,56 @@
     "files.exclude": {
         "**/node_modules": true,
         "**/.wwebjs_auth": true,
+        "**/.wwebjs_auth/**": true,
         "**/.wwebjs_cache": true,
+        "**/.wwebjs_cache/**": true,
         "**/dist": true,
+        "**/build": true,
         "**/uploads": true,
         "**/coverage": true,
         "**/*.db": true,
         "**/*.db-*": true,
-        "**/*.log": true
+        "**/*.log": true,
+        "**/*.webm": true,
+        "**/*.mp4": true,
+        "**/*.ogg": true,
+        "**/Crashpad": true,
+        "**/*.html": true
     },
     "search.exclude": {
         "**/node_modules": true,
         "**/.wwebjs_auth": true,
+        "**/.wwebjs_auth/**": true,
         "**/.wwebjs_cache": true,
+        "**/.wwebjs_cache/**": true,
         "**/dist": true,
         "**/uploads": true,
         "**/coverage": true,
         "**/*.db": true,
-        "**/*.log": true
+        "**/*.log": true,
+        "**/*.html": true
     },
+    "search.useIgnoreFiles": true,
+    "search.followSymlinks": false,
+    "search.useGlobalIgnoreFiles": true,
     "files.watcherExclude": {
         "**/node_modules/*/**": true,
-        "**/.wwebjs_auth/*/**": true,
-        "**/.wwebjs_cache/*/**": true,
+        "**/.wwebjs_auth": true,
+        "**/.wwebjs_auth/**": true,
+        "**/.wwebjs_cache": true,
+        "**/.wwebjs_cache/**": true,
         "**/dist/*/**": true,
+        "**/build/*/**": true,
         "**/uploads/*/**": true,
         "**/coverage/*/**": true,
         "**/*.db": true,
-        "**/*.log": true
+        "**/*.log": true,
+        "**/*.webm": true,
+        "**/*.mp4": true,
+        "**/*.ogg": true,
+        "**/Crashpad/*/**": true
     },
-    "typescript.disableAutomaticTypeAcquisition": true
+    "typescript.disableAutomaticTypeAcquisition": true,
+    "typescript.tsserver.maxTsServerMemory": 1024,
+    "javascript.format.enable": false
 }
