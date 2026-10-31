@@ -27,6 +27,24 @@ process.on('unhandledRejection', (reason, promise) => {
     console.error('[CRITICAL] 💥 Unhandled Rejection in whatsapp-service.js:', reason);
 });
 
+// --- ENTERPRISE SELF-HEALING: Patch Store.js for WA Web 2026+ Compatibility ---
+try {
+    const storePath = path.join(__dirname, 'node_modules', 'whatsapp-web.js', 'src', 'util', 'Injected', 'Store.js');
+    if (fs.existsSync(storePath)) {
+        let storeContent = fs.readFileSync(storePath, 'utf8');
+        if (storeContent.includes("setPushname: window.require('WAWebSetPushnameConnAction').setPushname")) {
+            storeContent = storeContent.replace(
+                "setPushname: window.require('WAWebSetPushnameConnAction').setPushname",
+                "setPushname: window.require('WAWebSetPushnameConnAction')?.setPushname"
+            );
+            fs.writeFileSync(storePath, storeContent, 'utf8');
+            console.log('[WA-Service] 🛡️ Auto-patched whatsapp-web.js Store.js for WA Web update compatibility.');
+        }
+    }
+} catch (e) {
+    console.error('[WA-Service] Store.js patch guard error:', e.message);
+}
+
 const phoneFormatter = require('./utils/phoneFormatter');
 
 ffmpeg.setFfmpegPath(finalFfmpegPath);
@@ -89,13 +107,13 @@ const flushQueue = async () => {
 const client = new Client({
     authStrategy: new LocalAuth({
         clientId: "wa-auto-client",
-        dataPath: "./.wwebjs_auth"
+        dataPath: path.join(__dirname, ".wwebjs_auth")
     }),
     authTimeoutMs: 60000,
     qrMaxRetries: 5,
     webVersionCache: {
         type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1015901307-alpha.html', 
+        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html', 
     },
     puppeteer: {
         executablePath: getChromePath(),
@@ -536,6 +554,27 @@ client.on('ready', async () => {
 client.on('authenticated', () => {
     console.log('[WA-Service] AUTHENTICATED');
     updateState('authenticated');
+
+    // Resiliency: If ready does not fire within 5s due to WA Web sync race-condition, verify and force ready
+    setTimeout(async () => {
+        if (lastState.state === 'authenticated' && client.pupPage) {
+            try {
+                console.log('[WA-Service] 🔍 Checking WhatsApp Web readiness pulse...');
+                const isReady = await client.pupPage.evaluate(() => typeof window.Store !== 'undefined');
+                if (isReady && !client.info) {
+                    console.log('[WA-Service] ⚡ Session verified active in browser. Emitting READY...');
+                    const info = await client.pupPage.evaluate(() => {
+                        return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
+                    });
+                    const ClientInfo = require('whatsapp-web.js/src/structures/ClientInfo');
+                    client.info = new ClientInfo(client, info);
+                    client.emit('ready');
+                }
+            } catch (err) {
+                console.error('[WA-Service] Auth recovery notice:', err.message);
+            }
+        }
+    }, 5000);
 });
 
 client.on('auth_failure', (msg) => {

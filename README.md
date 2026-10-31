@@ -46,3 +46,4 @@ You need to run both the backend and frontend servers.
 1.  Open the frontend URL in your browser.
 2.  Scan the QR code with your WhatsApp (Linked Devices).
 3.  Once connected, add customer numbers and send messages.
+4.  Run Full Project : 'npm.cmd run dev'

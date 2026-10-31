@@ -36,6 +36,7 @@ const ConnectView: React.FC<ConnectViewProps> = ({ isConnected, setIsConnected, 
 
   useEffect(() => {
     if (!socket) return;
+    socket.emit('get_status');
 
     if (socket.connected) {
       setSocketStatus('connected');
@@ -76,7 +77,14 @@ const ConnectView: React.FC<ConnectViewProps> = ({ isConnected, setIsConnected, 
         setLoading(false);
         setQrCode(null);
         setIsConnected(false);
-      } else if (status.state === 'ready' || status.state === 'authenticated') {
+      } else if (status.state === 'authenticated') {
+        setLoading(true);
+        setConnectionStep('Synchronizing Account...');
+        if (status.accountInfo) {
+          setAccountInfo(status.accountInfo);
+        }
+        setError(null);
+      } else if (status.state === 'ready') {
         if (status.accountInfo) {
           setAccountInfo(status.accountInfo);
         }
