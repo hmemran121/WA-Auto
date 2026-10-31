@@ -36,6 +36,17 @@ const isValidPhoneNumber = (number) => {
 };
 
 /**
+ * Detects if a string is likely a WhatsApp Linked ID (LID)
+ * LIDs are usually 15-16 digits and often start with 1 (but not always).
+ */
+const isLid = (id) => {
+    if (!id || typeof id !== 'string') return false;
+    const cleaned = id.split('@')[0].replace(/[^\d]/g, '');
+    // LIDs are typically 15 or 16 digits. Standard phone numbers are 7-13.
+    return cleaned.length >= 15 && cleaned.length <= 17;
+};
+
+/**
  * Intelligent and Dynamic phone number formatter (Production Grade)
  * @param {string} number - The raw number input
  * @param {string} defaultRegion - The default region code (e.g., 'BD')
@@ -45,15 +56,17 @@ const formatNumber = (number, defaultRegion = 'BD') => {
     if (!number || typeof number !== 'string') return '';
 
     try {
-        // 1. Initial Cleaning
+        // 1. Initial Cleaning (PRESERVE @lid if present for identification, but strip for processing)
         let cleaned = number.trim();
+        const hasLidSuffix = cleaned.endsWith('@lid');
+        
         cleaned = cleaned.replace(/[^\d+]/g, '');
         if (cleaned.startsWith('00')) cleaned = '+' + cleaned.substring(2);
         if (!cleaned) return '';
 
         // 2. Handle Group IDs & Non-Standard Identifiers
-        // If it looks like a group ID or extremely long ID (>15), return as is
-        if (cleaned.length > 15 && !cleaned.includes('@')) {
+        // If it looks like a group ID or LID, return it but ensure it doesn't have multiple suffixes later
+        if (isLid(cleaned) || hasLidSuffix) {
             return cleaned;
         }
 
@@ -100,4 +113,5 @@ const formatNumber = (number, defaultRegion = 'BD') => {
     }
 };
 
-module.exports = { formatNumber, isValidPhoneNumber };
+module.exports = { formatNumber, isValidPhoneNumber, isLid };
+

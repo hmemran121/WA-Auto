@@ -13,7 +13,16 @@ const schedulerBus = require('./schedulerBus');
 const CampaignService = require('./campaign-service');
 const vectorService = require('./vector-service');
 const { execSync } = require('child_process');
+const crypto = require('crypto');
 require('dotenv').config();
+
+process.on('uncaughtException', (err) => {
+    console.error('[CRITICAL] 💥 Uncaught Exception in server.js:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[CRITICAL] 💥 Unhandled Rejection in server.js:', reason);
+});
 
 // Configure Multer
 const storage = multer.diskStorage({
@@ -25,11 +34,19 @@ const upload = multer({ storage: storage });
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*", methods: ["GET", "POST"] } });
+global.io = io; // Make io accessible globally for db.js and other modules
 
 let waStatus = { state: 'disconnected', data: null, error: null };
 
 const debugLog = (msg) => {
     try { fs.appendFileSync(path.join(__dirname, 'debug.log'), `[${new Date().toISOString()}] ${msg}\n`); } catch (e) { }
+};
+
+const isCurrentlyTransferred = (notes) => {
+    if (!notes) return false;
+    const lastTransfer = notes.lastIndexOf('[Transferred]');
+    const lastRestore = notes.lastIndexOf('[Debt Restored]');
+    return lastTransfer > -1 && lastTransfer > lastRestore;
 };
 
 app.use(cors());
@@ -119,6 +136,218 @@ app.patch('/api/processes/:id/resume', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// ── Enterprise Outbox Dispatcher (Background Worker) ────────────────
+const startOutboxWorker = () => {
+    console.log('[Outbox] Starting Background Dispatcher...');
+    
+    // Recovery: On startup, reset any 'sending' status messages to 'pending'
+    db.resetStaleOutbox().then(res => {
+        if (res.changes > 0) console.log(`[Outbox] 🩹 Recovered ${res.changes} stalled messages.`);
+    }).catch(e => console.error('[Outbox] Recovery failed:', e));
+
+    setInterval(async () => {
+        // Only dispatch if service is READY
+        if (waStatus.state !== 'ready') return;
+
+        try {
+            const pending = await db.getPendingFromOutbox(5); // Process in small batches
+            if (pending.length === 0) return;
+
+            console.log(`[Outbox] 📦 Dispatching batch of ${pending.length} pending messages...`);
+
+            for (const item of pending) {
+                // --- SANITY CHECK: MALFORMED JID GUARD ---
+                if (!item.chat_id || item.chat_id === '@c.us' || item.chat_id === '@g.us') {
+                    console.warn(`[Outbox] ⚠️ Skipping malformed entry ${item.id}: Invalid chat_id='${item.chat_id}'`);
+                    await db.updateOutboxStatus(item.id, 'failed', 'Malformed Chat ID (Empty Number)');
+                    continue;
+                }
+
+                // Mark as sending to prevent duplicate dispatch in next interval
+                await db.updateOutboxStatus(item.id, 'sending');
+
+                const mediaPayload = item.media_payload ? JSON.parse(item.media_payload) : null;
+                const options = item.options ? JSON.parse(item.options) : {};
+                const metadata = item.metadata ? JSON.parse(item.metadata) : {};
+
+                let targetChatId = item.chat_id;
+                if (phoneFormatter.isLid(targetChatId)) {
+                    const pureDigits = targetChatId.split('@')[0].replace(/[^\d]/g, '');
+                    targetChatId = `${pureDigits}@lid`;
+                }
+
+                io.emit('service_send_message', {
+                    chatId: targetChatId,
+                    text: item.text,
+                    mediaPath: mediaPayload?.url || null,
+                    mediaType: mediaPayload?.type || null,
+                    options: options,
+                    queueId: item.id, // THE ANCHOR: Service MUST return this
+                    to: metadata.customer_number || item.chat_id.split('@')[0],
+                    contactName: metadata.contactName || 'Customer'
+                });
+            }
+        } catch (err) {
+            console.error('[Outbox Worker Error]', err);
+        }
+    }, 4000); // Check every 4 seconds
+};
+
+if (process.env.NODE_ENV !== 'test') {
+    startOutboxWorker();
+}
+
+/**
+ * AI Configuration Recovery Worker (Persistence Guard)
+ * Automatically resets 'limit_exceeded' and 'error' flags to 'active' 
+ * periodically to allow the system to recover from transient outages.
+ */
+const startAIConfigRecoveryWorker = () => {
+    // Initial reset on startup
+    db.resetStaleAIConfigs().catch(e => console.error('[AI Recovery] Startup reset error:', e));
+
+    setInterval(async () => {
+        try {
+            const result = await db.resetStaleAIConfigs();
+            if (result.changes > 0) {
+                console.log(`[AI Recovery] 🔄 Automatically re-enabled ${result.changes} AI configurations.`);
+            }
+        } catch (err) {
+            console.error('[AI Recovery Worker Error]', err);
+        }
+    }, 30 * 60000); // Check every 30 minutes
+};
+
+if (process.env.NODE_ENV !== 'test') {
+    startAIConfigRecoveryWorker();
+}
+
+/**
+ * AI Generation Retry Worker (Business Continuity)
+ * Picks up failed AI generation tasks from the queue and retries them.
+ * This ensures no customer message goes unanswered due to temporary AI outages.
+ */
+const recoverUnrepliedMessages = async () => {
+    try {
+        const profile = await db.getBusinessProfile();
+        if (!profile || profile.ai_auto_reply_enabled !== 'true') return;
+
+        const unreplied = await db.getUnrepliedIncomingMessages(24);
+        if (!unreplied || unreplied.length === 0) return;
+
+        console.log(`[Offline-Recovery] 🔄 Found ${unreplied.length} un-replied customer messages. Processing recovery...`);
+
+        for (const msg of unreplied) {
+            const customerNumber = msg.number;
+            const text = msg.text;
+
+            // 🛡️ Guard 1: Skip if human agent manually replied since customer message
+            const hasReplied = await db.hasRepliedSince(customerNumber, msg.timestamp);
+            if (hasReplied) {
+                console.log(`[Offline-Recovery] 🛑 Skipping ${customerNumber}. Manual reply detected.`);
+                continue;
+            }
+
+            // 🛡️ Guard 2: Skip if task is already in queue
+            const isQueued = await db.isAIRetryQueuedForNumber(customerNumber);
+            if (isQueued) continue;
+
+            console.log(`[Offline-Recovery] ⚡ Auto-queuing recovery task for ${customerNumber}: "${text.substring(0, 30)}..."`);
+            
+            const enhancedContext = await db.getEnhancedConversationContext(customerNumber, 10);
+            
+            await db.addAIRetryTask(
+                customerNumber,
+                text,
+                {
+                    context: enhancedContext.fullContext,
+                    history: enhancedContext.fullContext,
+                    userMessage: text,
+                    businessName: profile.company_name,
+                    customerNumber: customerNumber,
+                    receivedAt: msg.timestamp,
+                    notifyName: msg.contact_name || 'Customer'
+                }
+            );
+        }
+    } catch (e) {
+        console.error('[Offline-Recovery Error]', e.message);
+    }
+};
+
+const startAIRetryWorker = () => {
+    // Initial startup reset and unreplied recovery scan
+    db.resetStaleAIRetryTasks()
+        .then(() => recoverUnrepliedMessages())
+        .catch(e => console.error('[AI-Retry] Startup reset error:', e));
+
+    setInterval(async () => {
+        // Periodically check for unreplied offline messages
+        await recoverUnrepliedMessages();
+
+        try {
+            const pendingTasks = await db.getPendingAIRetryTasks(5);
+            if (!pendingTasks || pendingTasks.length === 0) return;
+
+            console.log(`[AI-Retry-Worker] 🔄 Attempting recovery for ${pendingTasks.length} pending AI tasks...`);
+
+            for (const task of pendingTasks) {
+                try {
+                    // Mark as processing to handle concurrent workers/restarts
+                    await db.updateAIRetryStatus(task.id, 'processing');
+
+                    const payload = JSON.parse(task.payload);
+                    const { context, history, userMessage, businessName, customerNumber, receivedAt } = payload;
+
+                    // 🛡️ SUPER HYBRID GUARD: Check if human already replied manually
+                    if (receivedAt) {
+                        const hasReplied = await db.hasRepliedSince(customerNumber, receivedAt);
+                        if (hasReplied) {
+                            console.log(`[AI-Hybrid] 🛑 Skipping retry for ${customerNumber}. Manual reply detected.`);
+                            await db.deleteAIRetryTask(task.id);
+                            continue;
+                        }
+                    }
+
+                    // Execute AI generation
+                    const aiResult = await aiService.generateAutoReply({
+                        context,
+                        history,
+                        userMessage,
+                        businessName,
+                        customerNumber
+                    });
+
+                    if (aiResult && aiResult.reply) {
+                        const cleanNumber = phoneFormatter.formatNumber(customerNumber);
+                        const chatId = `${cleanNumber}@c.us`;
+
+                        // Queue to Outbox (Standard Delivery)
+                        await db.addOutgoingQueue(chatId, aiResult.reply, null, {}, {
+                            customer_number: cleanNumber,
+                            contactName: payload.notifyName || 'Customer',
+                            isRecovered: true
+                        });
+
+                        // Mark as completed (Delete from queue)
+                        await db.deleteAIRetryTask(task.id);
+                        console.log(`[AI-Retry-Worker] ✅ Successfully recovered reply for ${customerNumber}`);
+                    }
+                } catch (taskErr) {
+                    console.error(`[AI-Retry-Worker] ❌ Retry failed for task ${task.id}:`, taskErr.message);
+                    await db.updateAIRetryStatus(task.id, 'failed', taskErr.message);
+                }
+            }
+        } catch (err) {
+            console.error('[AI-Retry-Worker Internal Error]', err);
+        }
+    }, 2 * 60000); // Check every 2 minutes
+};
+
+if (process.env.NODE_ENV !== 'test') {
+    startAIRetryWorker();
+}
 
 /**
  * POST /api/campaigns/run-instant
@@ -253,8 +482,6 @@ app.post('/api/campaigns/:id/resend', async (req, res) => {
         res.status(500).json({ success: false, error: err.message });
     }
 });
-
-const crypto = require('crypto');
 
 /**
  * Calculate SHA-256 hash of a file
@@ -492,28 +719,32 @@ io.on('connection', async (socket) => {
 
         const timestamp = new Date().toISOString();
 
-
+        // 🔒 GUARD 1.5: Reject Non-Numeric or Malformed Senders (Prevents @c.us loop)
+        const cleanFrom = phoneFormatter.formatNumber(from);
+        if (!cleanFrom || from === 'status@broadcast') {
+            return; // Silently ignore non-customer senders
+        }
 
         // Smart Sync: Automagically save/update customer
         try {
-            await db.syncCustomer(notifyName, from);
+            await db.syncCustomer(notifyName, cleanFrom);
         } catch (syncErr) {
             console.error('[Hub] Sync Error:', syncErr.message);
         }
 
-        const savedMsg = await db.addMessage(from, text, timestamp, 'received', 'received', whatsappId, mediaPath, mediaType, null, quotedMsg, metadata);
+        const savedMsg = await db.addMessage(cleanFrom, text, timestamp, 'received', 'received', whatsappId, mediaPath, mediaType, null, quotedMsg, metadata);
 
         // Track Response in Analytics
         try {
-            await db.recordTemplateResponse(from);
-            io.emit('analytics_update', { type: 'response', number: from });
+            await db.recordTemplateResponse(cleanFrom);
+            io.emit('analytics_update', { type: 'response', number: cleanFrom });
         } catch (resErr) {
             console.error('[Hub] Analytics Response Error:', resErr);
         }
 
         io.emit('new_message', {
             id: savedMsg.id,
-            number: from,
+            number: cleanFrom,
             text,
             timestamp,
             status: 'received',
@@ -529,7 +760,7 @@ io.on('connection', async (socket) => {
         /* AI ULTRA-HYBRID RAG Auto Reply Hook */
         try {
             const profile = await db.getBusinessProfile();
-            const aiStatus = await db.getCustomerAIStatus(from);
+            const aiStatus = await db.getCustomerAIStatus(cleanFrom);
 
             // 🔒 GUARD 1: Global and Customer-specific AI status checks
             const isAIEnabled = profile.ai_auto_reply_enabled === 'true';
@@ -545,53 +776,229 @@ io.on('connection', async (socket) => {
                 }
 
                 if (!isHandoverRequested) {
-                    // Step 1: Fetch 5 messages of context
-                    const history = await db.getConversationContext(from, 5);
-                    
-                    // Step 2: Build Enhanced Context
-                    const contextStr = await vectorService.getUnifiedContext(text);
+                    const languageNeutralParser = require('./utils/languageNeutralParser');
+                    const queryAnalysis = languageNeutralParser.analyzeQueryIntent(text);
 
-                    // Step 3: Generate Smart Reply
-                    const aiResult = await aiService.generateAutoReply({
-                        context: contextStr,
-                        history: history,
-                        userMessage: text,
-                        businessName: profile.company_name
-                    });
+                    // 🛡️ GUARD 2.5: Silently ignore internal system tasks (e.g. 'Task: auto_reply')
+                    if (queryAnalysis.isSystemTask) {
+                        console.log(`[Hub] 🛑 Internal system task string ignored: "${text.substring(0, 30)}"`);
+                        return;
+                    }
+
+                    const queryLower = text.trim().toLowerCase();
+                    const normalizedQuery = queryLower
+                        .replace(/[?।!]/g, '')
+                        .replace(/\s+/g, ' ');
+
+                    const queryHash = crypto.createHash('sha256').update(normalizedQuery).digest('hex');
+                    let cachedResponse = null;
+                    let aiResult = null;
+                    let queryEmbedding = null;
+
+                    // Layer 1: Exact Cache Check
+                    try {
+                        cachedResponse = await db.getCachedAIResponse(queryHash);
+                    } catch(e) {}
+
+                    // Fetch Dynamic Cache Settings
+                    let semanticThresholdVal = 0.95;
+                    try {
+                        const thresholdSetting = await db.getSetting('cache_similarity_threshold');
+                        if (thresholdSetting) semanticThresholdVal = parseFloat(thresholdSetting);
+                    } catch (e) {}
+
+                    // Step 1: Fetch Enhanced Context (Summary + Last 10 Raw Messages)
+                    const enhancedContext = await db.getEnhancedConversationContext(from, 10);
+
+                    // Layer 2: Universal Vector Semantic Cache Check (Active for ALL messages, no rawCount limit!)
+                    if (!cachedResponse && !queryAnalysis.isDynamicMath && !queryAnalysis.isContextDependent) {
+                        try {
+                            queryEmbedding = await vectorService.generateEmbedding(normalizedQuery);
+                            const semanticHit = await vectorService.getSemanticCachedResponse(text, null, 'default', queryEmbedding);
+                            if (semanticHit) {
+                                cachedResponse = { response_text: typeof semanticHit === 'string' ? semanticHit : JSON.stringify(semanticHit) };
+                            }
+                        } catch(e) { console.error('[Cache] Semantic Error:', e.message); }
+                    }
+
+                    if (cachedResponse) {
+                        console.log(`[Cache Hit] 🎯 Fast AI Cache Response served for: "${text.substring(0, 30)}..."`);
+                        try {
+                            const parsedHit = JSON.parse(cachedResponse.response_text);
+                            aiResult = {
+                                reply: parsedHit.reply || cachedResponse.response_text,
+                                handover: false,
+                                action: null,
+                                intel: parsedHit.intel || null,
+                                cached: true
+                            };
+                        } catch(e) {
+                            aiResult = { reply: cachedResponse.response_text, handover: false, action: null, cached: true };
+                        }
+                    } else {
+                        // Layer 3: Full AI Generation (Reuse queryEmbedding!)
+                        const contextStr = await vectorService.getUnifiedContextWithEmb(text, from, queryEmbedding);
+
+                        // Step 3: Generate Smart Reply
+                        aiResult = await aiService.generateAutoReply({
+                            context: contextStr,
+                            history: enhancedContext.fullContext,
+                            userMessage: text,
+                            businessName: profile.company_name,
+                            customerNumber: from
+                        });
+
+                        // Save to Cache if it's a static FAQ browsing query
+                        if (aiResult && aiResult.reply && !aiResult.action && queryAnalysis.isStaticFAQ) {
+                            try {
+                                const detectedIntent = aiResult.detected_intent || (aiResult.intel ? aiResult.intel.detected_intent : 'GENERAL');
+                                await vectorService.setSemanticCachedResponse(text, detectedIntent, aiResult, 'default');
+                            } catch(e) { console.error('[Cache] Save Error:', e.message); }
+                        }
+                    }
 
                     if (aiResult.reply) {
                         const cleanNumber = phoneFormatter.formatNumber(from);
                         const chatId = `${cleanNumber}@c.us`;
 
-                        // Handle AI handovers (AI unsure)
+                        // 🕒 Adaptive Human-Mimic Delay: Bot Protection (Unified Delay)
+                        const wordCount = aiResult.reply.split(/\s+/).length;
+                        const thinkingDelay = Math.min(3000, 800 + (wordCount * 80));
+                        console.log(`[AI] Calculated mimic delay: ${thinkingDelay}ms for "${cleanNumber}"`);
+
+                        // Handle AI handovers
                         if (aiResult.handover) {
-                            await db.updateCustomerAIStatusByNumber(from, { handover_requested: 1 });
-                            io.emit('handover_alert', { number: from, name: notifyName });
+                            await db.updateCustomerAIStatusByNumber(cleanFrom, { handover_requested: 1 });
+                            io.emit('handover_alert', { number: cleanFrom, name: notifyName });
                         }
 
-                        // Log the interaction for the Command Center
-                        await db.logAIInteraction({
-                            customer_number: from,
-                            user_query: text,
-                            ai_response: aiResult.reply,
-                            context_used: contextStr,
-                            confidence_score: aiResult.handover ? 0.5 : 0.95, // Estimated mapping
-                            is_handover: aiResult.handover
-                        });
+                        // 🧠 Intelligence Sync: Update global CRM with AI-detected tags/intel
+                        if (aiResult.intel) {
+                            try {
+                                await db.updateCustomerIntel(cleanFrom, aiResult.intel);
+                                
+                                // 📊 Behavioral Sync Engine: Calculate Scores
+                                const customer = await db.getCustomerByNumber(cleanFrom);
+                                let interestScore = customer ? (customer.interest_score || 0) : 0;
+                                let sensitivityScore = customer ? (customer.price_sensitivity_score || 0) : 0;
 
-                        io.emit('service_send_message', {
-                            chatId,
-                            text: aiResult.reply,
-                            options: {},
-                            to: cleanNumber,
-                            contactName: notifyName
-                        });
+                                // Rate Limiting/Bargaining Check
+                                if (aiResult.intel.tags?.some((t) => /bargain|discount|cheap|price/i.test(t))) {
+                                    sensitivityScore = Math.min(100, sensitivityScore + 15);
+                                }
+                                
+                                // Engagement Check (Interest)
+                                if (text.length > 20) interestScore = Math.min(100, interestScore + 5);
+                                if (aiResult.intel.lifecycle_stage === 'opportunity') interestScore = Math.min(100, interestScore + 10);
+
+                                await db.updateCustomerMetrics(cleanFrom, {
+                                    interest_score: interestScore,
+                                    price_sensitivity_score: sensitivityScore
+                                });
+
+                                io.emit('contact_updated', { 
+                                    number: cleanFrom, 
+                                    intel: aiResult.intel,
+                                    metrics: { interest_score: interestScore, price_sensitivity_score: sensitivityScore }
+                                });
+                            } catch (intelErr) {
+                                console.error('[AI] Failed to sync intelligence:', intelErr);
+                            }
+                        }
+
+                        // 📦 Infinite Memory: Check if summarization is needed (threshold: 15 messages)
+                        if (enhancedContext.rawCount >= 15) {
+                            setImmediate(async () => {
+                                try {
+                                    const newSummary = await aiService.summarizeHistory(enhancedContext.fullContext, enhancedContext.currentSummary);
+                                    await db.updateCustomerSummary(cleanFrom, newSummary);
+                                } catch(e) {
+                                    console.error('[BG-Summarize]', e);
+                                }
+                            });
+                        }
+
+                        // Step 4: [INTENT AUTOMATION / ORDER MANAGEMENT]
+                        if (aiResult.action === 'PLACE_ORDER' && aiResult.intel?.extract) {
+                            try {
+                                const orderData = {
+                                    customer_number: cleanNumber,
+                                    total_amount: aiResult.intel.extract.total_amount || 0,
+                                    items: aiResult.intel.extract.items || [],
+                                    shipping_address: aiResult.intel.address || aiResult.intel.extract.address || null,
+                                    delivery_charge: aiResult.intel.extract.delivery_charge || 0,
+                                    discount: aiResult.intel.extract.discount || 0,
+                                    status: 'pending'
+                                };
+                                const newOrder = await db.addOrder(orderData);
+                                aiResult.reply = aiResult.reply.replace('{{order_id}}', newOrder.id);
+                                debugLog(`[OMS] 🛍️ Order created for ${cleanNumber}: ID ${newOrder.id}`);
+                            } catch (orderErr) {
+                                console.error('[OMS] Error placing order:', orderErr);
+                                aiResult.reply = aiResult.reply.replace('{{order_id}}', 'SYSTEM_PENDING');
+                            }
+                        }
+
+                        if (aiResult.action && aiResult.action !== 'PLACE_ORDER') {
+                            const intentMedia = await db.getIntents().then(list => list.find(i => i.intent_tag === aiResult.action));
+                            if (intentMedia) {
+                                try {
+                                    await db.addOutgoingQueue(chatId, null, {
+                                        url: intentMedia.media_url,
+                                        type: intentMedia.media_type
+                                    }, {}, {
+                                        customer_number: cleanNumber,
+                                        contactName: notifyName,
+                                        isMedia: true
+                                    });
+                                } catch (qErr) {
+                                    console.error('[AI Hook] Failed to queue media intent:', qErr.message);
+                                }
+                                debugLog(`[AI Hook] 📦 Automated Media Queued for intent: ${aiResult.action}`);
+                            }
+                        }
+
+                        // PRODUCTION-GRADE: Queue response in Outbox for guaranteed delivery
+                        setTimeout(async () => {
+                            try {
+                                await db.addOutgoingQueue(chatId, aiResult.reply, null, {}, {
+                                    customer_number: cleanNumber,
+                                    contactName: notifyName
+                                });
+                                debugLog(`[AI Hook] 📦 Message queued for ${cleanNumber}`);
+                            } catch (qErr) {
+                                console.error('[AI Hook] Failed to queue message:', qErr.message);
+                            }
+                        }, thinkingDelay);
+                        
                         debugLog(`[AI Hook] Smart-Reply for ${cleanNumber}. Handover: ${aiResult.handover}`);
                     }
                 }
             }
         } catch (err) {
-            console.error('[AI Hook] Error during auto-reply generation:', err);
+            console.error('[AI Hook] Error during auto-reply generation. Queuing for retry:', err.message);
+            
+            // PRODUCTION-GRADE RECOVERY: Save to Retry Queue
+            try {
+                const contextStr = await vectorService.getUnifiedContext(text, from);
+                const enhancedContext = await db.getEnhancedConversationContext(from, 10);
+                const profile = await db.getBusinessProfile();
+                
+                await db.addAIRetryTask(from, text, {
+                    context: contextStr,
+                    history: enhancedContext.fullContext,
+                    userMessage: text,
+                    businessName: profile.company_name,
+                    customerNumber: from,
+                    notifyName: notifyName,
+                    receivedAt: timestamp // The anchor for the Hybrid Filter
+                });
+                console.log(`[AI Hook] 📦 Generation Task saved to Retry Queue for ${from}`);
+            } catch (queueErr) {
+                console.error('[AI Hook] CRITICAL: Failed to save retry task:', queueErr.message);
+            }
+
+            debugLog(`[AI Hook] ❌ Error: ${err.message}`);
         }
     });
 
@@ -634,6 +1041,7 @@ io.on('connection', async (socket) => {
         }
     });
 
+    // --- Enterprise Outbox Status Confirmation ---
     socket.on('service_message_result', async (data) => {
         const { success, whatsappId, error, originalData, notifyName } = data;
         const { to, text, contactId, contactName, mediaUrl, mediaType } = originalData;
@@ -669,12 +1077,36 @@ io.on('connection', async (socket) => {
                 quotedMsg: originalData.quotedText || (originalData.quotedMessageId ? '(Replying...)' : null),
                 metadata: metadata
             });
+
+            // --- Outbox Cleanup ---
+            if (data.queueId) {
+                try {
+                    await db.deleteFromOutbox(data.queueId);
+                    debugLog(`[Outbox] ✅ Entry ${data.queueId} cleared from queue.`);
+                } catch (qErr) {
+                    console.error('[Outbox] Failed to clear entry:', qErr);
+                }
+            }
             // Removed redundant new_message emit to prevent UI duplication
         } else {
             console.error('Service send error:', error);
             debugLog(`[Server] Error callback. campaignId: ${originalData.campaignId}`);
-            io.emit('message-error', { to, error });
-            await db.addMessage(cleanNumber, text, timestamp, `error: ${error}`, 'sent', null, null, null, null, null, null, originalData.campaignId);
+            io.emit('message-error', { to, error: typeof error === 'string' ? error : (error?.message || 'Unknown Error') });
+            
+            // --- Outbox Status Recovery (BUG FIX) ---
+            if (data.queueId) {
+                try {
+                    const errorMsg = typeof error === 'string' ? error : (error?.message || 'Unknown');
+                    await db.updateOutboxStatus(data.queueId, 'failed', errorMsg);
+                    debugLog(`[Outbox] ❌ Entry ${data.queueId} marked as failed.`);
+                } catch (qErr) {
+                    console.error('[Outbox] Failed to update fail status:', qErr);
+                }
+            }
+
+            if (cleanNumber) {
+                await db.addMessage(cleanNumber, text, timestamp, `error: ${error}`, 'sent', null, null, null, null, null, null, originalData.campaignId);
+            }
         }
     });
 
@@ -953,9 +1385,37 @@ app.post('/api/ai-brain/products', async (req, res) => {
 
 app.put('/api/ai-brain/products/:id', async (req, res) => {
     try {
-        await db.updateAIProduct(req.params.id, { ...req.body, manual_override: 1, embedding: null }); // nullify embedding so it regenerates
+        const { category_id, ...rest } = req.body;
+        const productId = req.params.id;
+        
+        // 1. Update Database
+        await db.updateAIProduct(productId, { ...rest, category_id, manual_override: 1, embedding: null });
+        
+        // 2. Trigger Real-time AI Vector Re-indexing (Fire and forget or wait depending on UX)
+        // We trigger it without blocking the response for maximum speed, 
+        // but it runs in the background to ensure AI memory is fresh.
+        vectorService.reindexProduct(productId).then(success => {
+            if (success) {
+                io.emit('intelligent_products_changed'); // Notify UI that vector is ready
+                console.log(`[Hub] Real-time Vector Sync Complete for ${productId}`);
+            }
+        });
+
         io.emit('intelligent_products_changed');
-        res.json({ success: true });
+        res.json({ success: true, message: 'Intelligence record updated and re-indexing triggered.' });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.patch('/api/ai-brain/products/:id/stock', async (req, res) => {
+    try {
+        const { stock_quantity, variants } = req.body;
+        const productId = req.params.id;
+        
+        // Use the existing db.updateAIProduct to update ONLY stock-related fields
+        await db.updateAIProduct(productId, { stock_quantity, variants });
+        
+        io.emit('intelligent_products_changed');
+        res.json({ success: true, message: 'Stock updated successfully.' });
     } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
@@ -985,23 +1445,798 @@ app.post('/api/ai-brain/products/bulk-delete', async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// ── Smart Finance & Procurement APIs ──────────────────────────────────────────
+
+app.get('/api/ai-brain/procurements', async (req, res) => {
+    try { 
+        const batchId = req.query.batch_id;
+        const procurements = await db.getProcurements(batchId);
+        let expenses = [];
+        
+        if (batchId) {
+            expenses = await db.getBatchExpenses(batchId);
+        }
+        
+        res.json({ success: true, procurements, expenses }); 
+    }
+    catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/ai-brain/procurement-batches', async (req, res) => {
+    try { res.json({ success: true, batches: await db.getProcurementBatches() }); }
+    catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/ai-brain/procurements', async (req, res) => {
+    try {
+        const result = await db.addProcurement(req.body);
+        io.emit('intelligent_products_changed'); // Procurement updates stock
+        res.json({ success: true, id: result.id });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/ai-brain/procurements/batch', async (req, res) => {
+    try {
+        const result = await db.addProcurementsBatch(req.body);
+        io.emit('intelligent_products_changed'); // Notify UI to refresh stock levels
+        res.json({ success: true, count: result.count });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/ai-brain/procurements/last-price', async (req, res) => {
+    try {
+        const { product_id, variant_name } = req.query;
+        const price = await db.getLastPurchasePrice(product_id, variant_name || null);
+        res.json({ success: true, price });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/ai-brain/expenses', async (req, res) => {
+    try { res.json({ success: true, expenses: await db.getExpenses() }); }
+    catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/ai-brain/expenses', async (req, res) => {
+    try {
+        const result = await db.addExpense(req.body);
+        res.json({ success: true, id: result.id });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.delete('/api/ai-brain/expenses/:id', async (req, res) => {
+    try {
+        await db.deleteExpense(req.params.id);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/ai-brain/finance/overview', async (req, res) => {
+    try { res.json({ success: true, overview: await db.getFinanceOverview() }); }
+    catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── Supplier Management & Ledger ───────────────────────────────────────────────────
+
+app.get('/api/ai-brain/suppliers', async (req, res) => {
+    try { res.json({ success: true, suppliers: await db.getSuppliers() }); }
+    catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/ai-brain/suppliers', async (req, res) => {
+    try {
+        const result = await db.addSupplier(req.body);
+        res.json({ success: true, id: result.id });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/ai-brain/suppliers/:id/ledger', async (req, res) => {
+    try { res.json({ success: true, ledger: await db.getSupplierLedger(req.params.id) }); }
+    catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/ai-brain/suppliers/:id/batches', async (req, res) => {
+    try { res.json({ success: true, batches: await db.getSupplierBatches(req.params.id) }); }
+    catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/ai-brain/suppliers/payment', async (req, res) => {
+    try {
+        const result = await db.addSupplierPayment(req.body);
+        res.json({ success: true, id: result.id });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/ai-brain/categories', async (req, res) => {
+    try { res.json({ success: true, categories: await db.getCategories() }); }
+    catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/ai-brain/categories', async (req, res) => {
+    try {
+        const result = await db.addCategory(req.body);
+        io.emit('intelligent_products_changed'); // Categories affect products
+        res.json({ success: true, id: result.id });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.put('/api/ai-brain/categories/:id', async (req, res) => {
+    try {
+        await db.updateCategory(req.params.id, req.body);
+        io.emit('intelligent_products_changed');
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.delete('/api/ai-brain/categories/:id', async (req, res) => {
+    try {
+        await db.deleteCategory(req.params.id);
+        io.emit('intelligent_products_changed');
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
 app.get('/api/ai-brain/knowledge', async (req, res) => {
     try { res.json({ success: true, documents: await db.getKnowledgeDocuments() }); }
     catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
+// --- OMS (Order Management System) APIs ---
+app.get('/api/oms/orders', async (req, res) => {
+    try {
+        const customerNumber = req.query.customer_number;
+        const orders = await db.getOrders(customerNumber);
+        res.json({ success: true, orders });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/oms/orders/:id', async (req, res) => {
+    try {
+        const order = await db.getOrderById(req.params.id);
+        if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+        res.json({ success: true, order });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/oms/orders/:id/payments', async (req, res) => {
+    try {
+        const payments = await db.getOrderPayments(req.params.id);
+        res.json({ success: true, payments });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/oms/orders', async (req, res) => {
+    try {
+        let {
+            customer_number,
+            customer_name,
+            total_amount,
+            items,
+            delivery_charge = 0,
+            discount = 0,
+            order_notes = '',
+            shipping_address = '',
+            address_tag = 'Home'
+        } = req.body;
+        
+        // 🛡️ SANITATION LAYER: Ensure items is an actual array (Prevent double-encoding)
+        if (typeof items === 'string') {
+            try { items = JSON.parse(items); } catch (e) { items = []; }
+        }
+        if (!Array.isArray(items)) items = [];
+
+        if (!customer_number) {
+            return res.status(400).json({ success: false, error: 'Customer number is required.' });
+        }
+
+        // 1. Clean & format phone number
+        const cleanNumber = phoneFormatter.formatNumber(customer_number);
+
+        // [AUTO-CONSOLIDATION] - Ensure exactly one master pending order exists before processing
+        await db.consolidatePendingOrders(cleanNumber);
+
+        // 2. Fetch customer or Auto-create if new
+        let cust = await db.getCustomerByNumber(cleanNumber);
+        
+        if (!cust) {
+            const savedAddresses = shipping_address ? JSON.stringify([{ tag: address_tag, address: shipping_address }]) : '[]';
+            await db.addCustomer({ 
+                name: customer_name || 'New Customer', 
+                number: cleanNumber, 
+                address: shipping_address,
+                saved_addresses: savedAddresses
+            });
+            cust = await db.getCustomerByNumber(cleanNumber);
+        } else {
+            // Update profile if data provided is newer/better
+            const updates = {};
+            if (customer_name && customer_name !== cust.name && customer_name !== 'New Customer') updates.name = customer_name;
+            if (shipping_address && shipping_address !== cust.address) updates.address = shipping_address;
+            
+            // Smart Address List Management
+            if (shipping_address) {
+                let saved = [];
+                try { saved = JSON.parse(cust.saved_addresses || '[]'); } catch (e) { saved = []; }
+                
+                // Add or update matching tag
+                const existingIndex = saved.findIndex(a => a.tag === address_tag);
+                if (existingIndex > -1) {
+                    saved[existingIndex].address = shipping_address;
+                } else {
+                    saved.push({ tag: address_tag, address: shipping_address });
+                }
+                updates.saved_addresses = JSON.stringify(saved);
+            }
+
+            if (Object.keys(updates).length > 0) {
+                await db.updateCustomer(cust.id, updates);
+            }
+        }
+        
+        const currentNormalizedAddr = (shipping_address || 'UNSPECIFIED').trim().toLowerCase().replace(/\s+/g, ' ');
+
+        // [UNIFIED BALANCE ENGINE]
+        // activeUnpaidOrders: used for financial debt summation (Terminal nodes only to prevent duplication)
+        const activeUnpaidOrders = await db.getPreviousUnpaidOrders(cleanNumber);
+        
+        // mergeableCandidates: used for item harvesting (Includes all pending orders regardless of debt transfer)
+        const mergeableCandidates = await db.getMergeableCandidates(cleanNumber);
+        
+        let dynamicPreviousDue = 0;
+        for (const o of activeUnpaidOrders) {
+            // 🛡️ CHAIN-AWARE GUARD: Only count orders that haven't been transferred yet.
+            // If we count a transferred order, we double the debt because its successor already holds it.
+            if (o.is_debt_transferred === 0) {
+                const total = parseFloat(o.total_amount?.toString().replace(/[^0-9.]/g, '')) || 0;
+                const paid = parseFloat(o.amount_paid) || 0;
+                dynamicPreviousDue += (total - paid);
+            }
+        }
+
+        // Check for mergeable orders (Pending/Processing) that share the SAME address
+        // We look in mergeableCandidates to find ALL potential item sources
+        const mergeableOrder = (mergeableCandidates || []).find(o => 
+            ['pending', 'processing'].includes(o.status) && 
+            (o.shipping_address || 'UNSPECIFIED').trim().toLowerCase().replace(/\s+/g, ' ') === currentNormalizedAddr
+        );
+        
+        // If we found a mergeable order, its items will be combined. 
+        // We MUST subtract its balance from dynamicPreviousDue to avoid double-counting its items,
+        // BUT we must keep its own 'due_added' because that is debt it was already carrying from an even earlier predecessor.
+        let finalDueForNewOrder = dynamicPreviousDue;
+        let mergeMasterPaid = 0;
+
+        if (mergeableOrder) {
+            const mTotal = parseFloat(mergeableOrder.total_amount?.toString().replace(/[^0-9.]/g, '')) || 0;
+            const mPaid = parseFloat(mergeableOrder.amount_paid) || 0;
+            const mDueAdded = parseFloat(mergeableOrder.due_added) || 0;
+            
+            // Financial Transfer: Carry forward any payments made on the mergeable order
+            mergeMasterPaid = mPaid;
+
+            // Subtract only the 'Current Order Part' of the mergeable order (Items + Delivery - Discount)
+            // which is equivalent to (Total - DueAdded). 
+            // Since we move items, we don't want to count them as debt.
+            const mItemsPart = mTotal - mDueAdded;
+            finalDueForNewOrder -= (mItemsPart - mPaid); 
+        }
+        
+        const combinedDue = Math.max(0, finalDueForNewOrder);
+        let finalItems = [...items];
+        let mergeNotes = '';
+
+        if (mergeableOrder) {
+            try {
+                // Enrich items with source reference (Smart Dynamic: Preserve original source if exists)
+                const oldItems = JSON.parse(mergeableOrder.items || '[]').map(it => ({ 
+                    ...it, 
+                    mergedFrom: it.mergedFrom || mergeableOrder.id 
+                }));
+                // Prepend old items to keep chronological order
+                finalItems = [...oldItems, ...items];
+                
+                // Mark old order as merged and cancel it from active flow
+                await db.updateOrderStatus(mergeableOrder.id, 'merged');
+                
+                mergeNotes = `\n📦 *Smart Merge:* Items from previous Order #${mergeableOrder.id} have been consolidated into this delivery.`;
+                console.log(`[OMS] Smart Merged items from Order ${mergeableOrder.id} to new order.`);
+            } catch (err) {
+                console.error("Merge Engine Error:", err);
+            }
+        }
+
+        // [BUG 2 FIX] Ensure due from merged order is carried over
+        // [FIX] Duplicate combinedDue removed. Using the one calculated by UNIFIED BALANCE ENGINE.
+
+        // --- VALIDATION LAYER ---
+        // Use finalItems (which includes merged items) for correct total validation
+        const itemsSum = finalItems.reduce((sum, it) => sum + (parseFloat(it.price.toString().replace(/[^0-9.]/g, '')) || 0) * (it.qty || 1), 0);
+        const deliveryVal = parseFloat(delivery_charge) || 0;
+        const discountVal = parseFloat(discount) || 0;
+        const expectedTotal = itemsSum + deliveryVal - discountVal + combinedDue;
+        const actualTotal = parseFloat(total_amount.toString().replace(/[^0-9.]/g, '')) || 0;
+
+        if (Math.abs(actualTotal - expectedTotal) > 1) {
+            console.warn(`[OMS] Total Mismatch Detected! Expected: ${expectedTotal}, Received: ${actualTotal}. Forcing expected total for integrity.`);
+            total_amount = `৳${expectedTotal}`; // [FIX] Force correct total
+        }
+
+        // Create order directly with provided total amount
+        const newOrder = await db.createOrder({
+            customer_number: cleanNumber, 
+            items: JSON.stringify(finalItems),
+            total_amount: total_amount,
+            delivery_charge: delivery_charge,
+            discount,
+            order_notes: (order_notes || '') + mergeNotes,
+            shipping_address,
+            due_added: combinedDue,
+            amount_paid: mergeMasterPaid,
+            payment_status: mergeMasterPaid > 0 ? (mergeMasterPaid >= expectedTotal ? 'paid' : 'partial') : 'pending'
+        });
+
+        // CRITICAL: Link and Log the old order merge
+        if (mergeableOrder) {
+            await db.appendOrderNote(mergeableOrder.id, `Successor Master Order: #${newOrder.id}`);
+            await db.markDebtAsTransferred(mergeableOrder.id, newOrder.id);
+            // Calculate value of items being merged for the ledger
+            const oldItemsVal = oldItems.reduce((s, it) => s + (parseFloat(it.price?.toString().replace(/[^0-9.]/g, '')) || 0) * (it.qty || 1), 0);
+            await db.addOrderLog(newOrder.id, 'merge', 'none', 'pending', `📦 Smart Merged items from Order #${mergeableOrder.id}: ${oldItemsVal} TK`);
+            await db.addOrderLog(mergeableOrder.id, 'transferred', mergeableOrder.status, 'merged', `➡️ Balance transferred to Successor #${newOrder.id}`);
+            
+            // [AUDIT TRAIL] Link the transferred payment explicitly in the ledger
+            if (mergeMasterPaid > 0) {
+                await db.db.run("INSERT INTO order_payments (order_id, amount, method, notes) VALUES (?, ?, ?, ?)",
+                    [newOrder.id, mergeMasterPaid, 'transfer', `[LINKED] Balance Transferred from Merged Order #${mergeableOrder.id}`]);
+            }
+
+            const socket = req.app.get('socketio');
+            if (socket) socket.emit('order_status_updated', { id: mergeableOrder.id });
+        } else {
+            await db.addOrderLog(newOrder.id, 'creation', 'none', 'pending', `🆕 New order created for ${cleanNumber}`);
+        }
+
+        // Reset customer's previous due securely
+        await db.updateCustomerDue(cleanNumber, 0);
+
+        // 🔥 RE-MASTERING GUARD: Final cleanup to catch any orphans that might have been missed
+        await db.consolidatePendingOrders(cleanNumber);
+
+        // 3. Debt Transfer Logic: Mark old orders as transferred to prevent double-counting
+        // We use activeUnpaidOrders which we fetched earlier
+        if (activeUnpaidOrders.length > 0) {
+            try {
+                for (const oldOrder of activeUnpaidOrders) {
+                    // LINK: We link all unpaid orders (including the merged one) to the new master
+                    // This is essential for both financial tracking AND merge-reversion.
+
+                    const oldTotal = parseFloat(oldOrder.total_amount?.toString().replace(/[^0-9.]/g, '')) || 0;
+                    const oldPaid = parseFloat(oldOrder.amount_paid) || 0;
+                    const remaining = oldTotal - oldPaid;
+
+                    const isMergeSource = mergeableOrder && oldOrder.id === mergeableOrder.id;
+
+                    // Carry debt for ALL unpaid orders (Global Debt Channel)
+                    if (remaining > 0 || isMergeSource) {
+                        const transferNote = `[Transferred] Remaining balance of ৳${remaining.toLocaleString()} has been moved to New Order #${newOrder.id}.`;
+                        await db.appendOrderNote(oldOrder.id, transferNote);
+                        await db.markDebtAsTransferred(oldOrder.id, newOrder.id);
+                        await db.addOrderLog(oldOrder.id, 'debt_transfer', oldOrder.status, oldOrder.status, `💸 Debt transferred to New Order #${newOrder.id}`);
+                        await db.addOrderLog(newOrder.id, 'debt_pickup', 'none', 'pending', `📥 Picked up ৳${remaining} debt from Order #${oldOrder.id}`);
+                        console.log(`[OMS] Transferred debt from Order ${oldOrder.id} to Order ${newOrder.id}`);
+                    }
+                }
+            } catch (err) {
+                console.error("Debt Transfer Error:", err);
+            }
+        }
+
+        res.json({ success: true, order: newOrder });
+    } catch (e) {
+        console.error("Order Creation Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+// [AUDIT TRAIL] Fetch logs for a specific order
+app.get('/api/oms/orders/:id/predecessors', async (req, res) => {
+    try {
+        const predecessors = await db.getMergedPredecessorsRecursive(req.params.id);
+        res.json({ success: true, predecessors });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.get('/api/oms/orders/:id/debt-chain', async (req, res) => {
+    try {
+        console.log(`[FINANCE] Fetching debt chain for Order #${req.params.id}`);
+        const chain = await db.getDetailedDebtChain(req.params.id);
+        console.log(`[FINANCE] Chain found for #${req.params.id}: ${chain.length} nodes`);
+        res.json({ success: true, chain });
+    } catch (err) {
+        console.error(`[FINANCE] Error fetching chain for #${req.params.id}:`, err);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/oms/orders/:id/logs', async (req, res) => {
+    try {
+        const logs = await db.getOrderLogs(req.params.id);
+        res.json({ success: true, logs });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.patch('/api/oms/orders/:id/status', async (req, res) => {
+    try {
+        const { status, tracking_id, reactivateOrderIds } = req.body;
+        const orderId = req.params.id;
+
+        // 1. Fetch current order state before update
+        const order = await db.getOrderById(orderId);
+        if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+
+        // 🔒 Logical Guard: Delivery Address required for Production/Transit
+        if (['processing', 'shipped', 'delivered'].includes(status) && !order.customer_address) {
+            return res.status(400).json({ 
+                success: false, 
+                error: "Shipping address required before moving to " + status 
+            });
+        }
+
+        const oldStatus = order.status;
+        const result = await db.updateOrderStatus(orderId, status, tracking_id);
+        
+        // --- AUDIT LOGGING ---
+        await db.addOrderLog(orderId, 'status_change', oldStatus, status, `Order status moved from ${oldStatus} to ${status}`);
+        
+        // 2. Automated Debt Logic
+        if (oldStatus !== 'delivered' && status === 'delivered') {
+            // ORDER DELIVERED: Unpaid balance becomes permanent debt
+            const total = parseFloat(order.total_amount.toString().replace(/[^0-9.]/g, '')) || 0;
+            const paid = parseFloat(order.amount_paid || 0);
+            const balance = total - paid;
+            
+            if (balance > 0) {
+                await db.incrementCustomerDue(order.customer_number, balance);
+                await db.addOrderLog(orderId, 'debt_added', oldStatus, status, `💸 Order delivered with balance ৳${balance}. Added to customer due.`);
+                console.log(`[OMS] Order ${orderId} delivered. Added balance ${balance} to customer ${order.customer_number}`);
+            }
+        } else if (oldStatus !== 'cancelled' && (status === 'cancelled' || status === 'returned')) {
+            // ORDER CANCELLED/RETURNED: Restore any previous debt that was included in this order
+            
+            // 🛡️ INTELLIGENT CHAIN TRAVERSAL & TERMINAL GUARD
+            if (order.is_debt_transferred === 1) {
+                try {
+                    // Follow the Debt Chain to find the final living successor (The Head of the Chain)
+                    const lastActiveMaster = await db.findActiveSuccessiveMaster(orderId);
+
+                    const amountToDeduct = (parseFloat(order.total_amount.toString().replace(/[^0-9.]/g, '')) || 0) - (parseFloat(order.amount_paid) || 0);
+
+                    if (lastActiveMaster && !['delivered', 'cancelled'].includes(lastActiveMaster.status)) {
+                        // CASE A: Active Successor found -> Adjust its total
+                        await db.adjustOrderBalance(lastActiveMaster.id, -amountToDeduct);
+                        await db.addOrderLog(lastActiveMaster.id, 'debt_adjustment', lastActiveMaster.status, lastActiveMaster.status, `📉 Predecessor Order #${orderId} was CANCELLED. Total reduced by ৳${amountToDeduct}.`);
+                        await db.addOrderLog(orderId, 'successor_adjusted', oldStatus, status, `✅ Debt chain followed to Successor #${lastActiveMaster.id}. Total reduced.`);
+                        console.log(`[OMS] Debt Chain followed from ${orderId} to ${lastActiveMaster.id}. Reduced by ${amountToDeduct}`);
+                    } else if (lastActiveMaster && lastActiveMaster.status === 'delivered') {
+                        // CASE B: Terminal Guard -> Successor is Delivered. Adjust Profile.
+                        await db.incrementCustomerDue(order.customer_number, -amountToDeduct);
+                        
+                        const adjustmentNote = `[Financial Adjustment] Order #${orderId} cancelled after debt transfer to Delivered Successor #${lastActiveMaster.id}. ৳${amountToDeduct} credited to account.`;
+                        await db.appendCustomerNote(order.customer_number, adjustmentNote);
+                        await db.appendOrderNote(lastActiveMaster.id, `[Predecessor Cancelled] Order #${orderId} was cancelled. ৳${amountToDeduct} credit applied to customer.`);
+                        
+                        await db.addOrderLog(orderId, 'terminal_credit', oldStatus, status, `💸 Terminal Successor #${lastActiveMaster.id} is DELIVERED. ৳${amountToDeduct} credited to customer profile.`);
+                        console.log(`[OMS] Terminal Guard: Credited ${amountToDeduct} to profile because successor ${lastActiveMaster.id} is delivered.`);
+                    } else {
+                        // CASE C: Fallback to profile restoration if chain is broken
+                        const restoredDue = parseFloat(order.due_added) || 0;
+                        if (restoredDue > 0) {
+                            await db.incrementCustomerDue(order.customer_number, restoredDue);
+                            await db.addOrderLog(orderId, 'restoration', oldStatus, status, `🔄 Chain broken. Restored ৳${restoredDue} to profile.`);
+                        }
+                    }
+                } catch (err) {
+                    console.error("[OMS] Chain Traversal Error:", err);
+                }
+            } else {
+                // No successor, normal restoration to profile
+                const restoredDue = parseFloat(order.due_added) || 0;
+                if (restoredDue > 0) {
+                    await db.incrementCustomerDue(order.customer_number, restoredDue);
+                    
+                    const note = `[Debt Restored] Previous balance is active again (Order #${orderId} was ${status}).`;
+                    await db.appendOrderNote(orderId, note);
+                    await db.addOrderLog(orderId, 'restoration', oldStatus, status, `🔄 Restored ৳${restoredDue} to customer profile due to cancellation`);
+                }
+            }
+
+            // [GRANULAR MERGE REVERSION] - Universal: Restore selected merged ancestors recursively
+            try {
+                const mergedAncestors = await db.getMergedPredecessorsRecursive(orderId);
+                for (const mOrder of mergedAncestors) {
+                    const shouldReactivate = reactivateOrderIds && reactivateOrderIds.some(id => String(id) === String(mOrder.id));
+
+                    if (shouldReactivate) {
+                        // 💉 SURGICAL FILTERING: Remove items from non-reactivated predecessors
+                        let items = JSON.parse(mOrder.items || '[]');
+                        const beforeCount = items.length;
+                        items = items.filter(it => {
+                            const sourceId = it.mergedFrom || mOrder.id;
+                            return String(sourceId) === String(mOrder.id) || 
+                                   (reactivateOrderIds && reactivateOrderIds.some(rid => String(rid) === String(sourceId)));
+                        });
+                        const itemsTotal = items.reduce((sum, it) => {
+                             const p = parseFloat(it.price?.toString().replace(/[^0-9.]/g, '')) || 0;
+                             return sum + (p * (it.qty || 1));
+                        }, 0);
+                        const finalTotal = itemsTotal + (parseFloat(mOrder.delivery_charge) || 0) - (parseFloat(mOrder.discount) || 0) + (parseFloat(mOrder.due_added) || 0);
+                        await new Promise((res) => {
+                            db.db.run("UPDATE orders SET items = ?, total_amount = ?, debt_source_order_id = NULL, is_debt_transferred = 0 WHERE id = ?", 
+                                [JSON.stringify(items), `৳${finalTotal}`, mOrder.id], () => res());
+                        });
+                        await db.updateOrderStatus(mOrder.id, 'pending');
+                        await db.addOrderLog(mOrder.id, 'unmerge', 'merged', 'pending', `🔄 Surgical Un-merge: Items filtered from ${beforeCount} to ${items.length} based on selection.`);
+                    } else {
+                        await db.updateOrderStatus(mOrder.id, 'cancelled');
+                        await db.addOrderLog(mOrder.id, 'status_change', 'merged', 'cancelled', `🚫 Master Order #${orderId} was cancelled. This merged ancestor is also cancelled.`);
+                    }
+                }
+            } catch (unmergeErr) {
+                console.error("[OMS] Recursive Merge Reversion Error:", unmergeErr);
+            }
+        }
+
+        // 🔥 RE-MASTERING ENGINE: Consolidation of reactivated predecessors
+        // This handles cases where a master was cancelled and predecessors were restored to pending.
+        await db.consolidatePendingOrders(order.customer_number);
+
+        const io = global.io;
+        if (io) {
+            io.emit('order_status_updated', { id: orderId, status, tracking_id });
+            // [CRM EVOLUTION] Recalculate LTV if status changed to/from 'cancelled'
+            if (oldStatus === 'cancelled' || status === 'cancelled' || status === 'delivered') {
+                await db.recalculateCustomerLTV(order.customer_number);
+                io.emit('customer_intel_updated', { number: order.customer_number, action: 'ltv_sync' });
+            }
+        }
+        
+        res.json({ success: true, ...result });
+    } catch (e) { 
+        console.error("Order Status Update Error:", e);
+        res.status(500).json({ success: false, error: e.message }); 
+    }
+});
+
+app.get('/api/oms/customers/:number/active-orders', async (req, res) => {
+    try {
+        const query = `
+            SELECT id, status, total_amount, shipping_address, created_at 
+            FROM orders 
+            WHERE customer_number = ? 
+            AND status IN ('pending', 'processing', 'shipped')
+            ORDER BY id DESC
+        `;
+        db.db.all(query, [req.params.number], (err, rows) => {
+            if (err) throw err;
+            res.json({ success: true, orders: rows });
+        });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.patch('/api/oms/orders/:id/verify', async (req, res) => {
+    try {
+        const { status } = req.body;
+        const result = await db.verifyOrder(req.params.id, status);
+        
+        io.emit('order_verified', { id: req.params.id, verified: status });
+        res.json({ success: true, ...result });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.patch('/api/oms/orders/:id/payment', async (req, res) => {
+    try {
+        const { payment_status, amount_paid, method, notes } = req.body;
+        const orderId = req.params.id;
+
+        // 1. Fetch current order state before update
+        const order = await db.getOrderById(orderId);
+        if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+
+        const oldPaid = parseFloat(order.amount_paid || 0);
+        const newPaidValue = parseFloat(amount_paid || 0);
+        const diff = newPaidValue - oldPaid;
+
+        if (diff <= 0) {
+            // Just update status if no money added
+            const result = await db.updateOrderPayment(orderId, { payment_status, amount_paid: newPaidValue });
+            return res.json({ success: true, ...result });
+        }
+
+        // --- SMART PAYMENT ENGINE CALL ---
+        // This handles atomic recording, linked propagation, and profile sync.
+        const result = await db.processSmartOrderPayment(orderId, diff, method || 'cash', notes || 'Manual Payment Entry');
+        
+        if (!result.success) throw new Error("Payment processing failed");
+
+        // [LOGIC REFINEMENT] 
+        // As per Senior System Architect & User Mandate:
+        // Downward propagation of payments (Master -> Predecessors) is disabled 
+        // to maintain ledger isolation and fulfill Source-Pinned Payment standards.
+        // Predecessors will remain in 'Transferred' state without physical payment records.
+
+
+        // Notify UI of changes
+        io.emit('order_payment_updated', { id: orderId, payment_status, amount_paid: newPaidValue });
+        io.emit('order_status_updated', { id: orderId }); 
+        
+        res.json({ success: true, ...result });
+    } catch (e) { 
+        console.error("Payment Sync & Settlement Error:", e);
+        res.status(500).json({ success: false, error: e.message }); 
+    }
+});
+
+app.patch('/api/oms/orders/:id/manifest', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { items, total_amount, delivery_charge, discount } = req.body;
+        
+        const result = await db.updateOrderManifest(id, items, total_amount, delivery_charge, discount);
+        
+        if (result.success && result.order) {
+            // [CRM EVOLUTION] Recalculate LTV as total_amount might have changed
+            await db.recalculateCustomerLTV(result.order.customer_number);
+            io.emit('order_manifest_updated', { id, items, total_amount });
+            io.emit('customer_intel_updated', { number: result.order.customer_number, action: 'manifest_ltv_sync' });
+        }
+        res.json({ success: true, ...result });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.patch('/api/oms/orders/:id/meta', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { delivery_charge, shipping_address, shipping_phone } = req.body;
+        
+        const result = await db.updateOrderMeta(id, { delivery_charge, shipping_address, shipping_phone });
+        
+        if (result.success) {
+            // 🔄 Intelligence Sync: Fetch full order to trigger LTV and UI sync
+            const updatedOrder = await db.getOrderById(id);
+            if (updatedOrder) {
+                // [CRM SYNC] If address updated, also update customer profile
+                if (shipping_address) {
+                    try {
+                        const cust = await db.getCustomerByNumber(updatedOrder.customer_number);
+                        if (cust) await db.updateCustomer(cust.id, { address: shipping_address });
+                    } catch (err) { console.error("[OMS Sync] Customer address sync failed:", err); }
+                }
+
+                await db.recalculateCustomerLTV(updatedOrder.customer_number);
+                io.emit('order_manifest_updated', { 
+                    id, 
+                    total_amount: updatedOrder.total_amount,
+                    delivery_charge: updatedOrder.delivery_charge,
+                    shipping_address: updatedOrder.shipping_address
+                });
+                io.emit('customer_intel_updated', { number: updatedOrder.customer_number, action: 'meta_ltv_sync' });
+            }
+        }
+        res.json({ success: true, ...result });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/oms/orders/:id/send-memo', async (req, res) => {
+    try {
+        const orderId = req.params.id;
+        const order = await db.getOrderById(orderId);
+        
+        if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+        if (!order.customer_number) return res.status(400).json({ success: false, error: 'Customer number missing' });
+
+        const history = await db.getOrderPayments(orderId);
+        const cleanNumber = phoneFormatter.formatNumber(order.customer_number);
+        const chatId = `${cleanNumber}@c.us`;
+
+        let itemsList = '';
+        const itemsArray = JSON.parse(order.items || '[]');
+        itemsArray.forEach(it => {
+            const variantStr = it.variant && it.variant !== 'None' ? ` [${it.variant}]` : '';
+            const itemPrice = parseFloat(it.price?.toString().replace(/[^0-9.]/g, '') || 0);
+            const itemQty = it.qty || 1;
+            const itemTotal = itemPrice * itemQty;
+            itemsList += `▫️ *${it.name}*${variantStr}\n   ৳${itemPrice.toLocaleString()} x ${itemQty} = *৳${itemTotal.toLocaleString()}*\n`;
+        });
+
+        // Financial Logic
+        const subtotal = itemsArray.reduce((acc, it) => acc + (parseFloat(it.price?.toString().replace(/[^0-9.]/g, '') || 0) * (it.qty || 1)), 0);
+        const delivery = order.delivery_charge || 0;
+        const discount = order.discount || 0;
+        const prevDue = order.due_added || 0;
+        const totalInvoice = subtotal + delivery + prevDue - discount;
+        const amountPaid = order.amount_paid || 0;
+        
+        const isTransferred = isCurrentlyTransferred(order.order_notes);
+        const netBalance = isTransferred ? 0 : (totalInvoice - amountPaid);
+
+        // Build Payment History String
+        let historySection = '';
+        if (history && history.length > 0) {
+            historySection = `\n💰 *Payment History:*`;
+            history.forEach((p) => {
+                const dateString = new Date(p.payment_date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+                historySection += `\n   └ ${dateString}: *৳${p.amount.toLocaleString()}* (${p.notes || p.method})`;
+            });
+            historySection += `\n`;
+        }
+
+        // Summary Lines
+        let summaryLines = `Subtotal: ৳${subtotal.toLocaleString()}\n`;
+        summaryLines += `Delivery: ৳${delivery.toLocaleString()}\n`;
+        if (discount > 0) summaryLines += `Discount: -৳${discount.toLocaleString()}\n`;
+        if (prevDue > 0) summaryLines += `Previous Due: +৳${prevDue.toLocaleString()}\n`;
+        
+        const successorMatches = [...(order.order_notes || '').matchAll(/New Order #(\d+)/g)];
+        const successorId = successorMatches.length > 0 ? successorMatches[successorMatches.length - 1][1] : null;
+        const transferNote = isTransferred ? `\n⚠️ *Note:* Remaining balance was moved to Order #${successorId || 'a newer order'}.` : '';
+
+        const memo = `*ORDER MEMO - #${order.id}*
+──────────────────────
+👤 *Customer:* ${order.customer_name || 'Guest'}
+📱 *Contact:* ${cleanNumber}
+📅 *Date:* ${new Date(order.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+
+📦 *Order Items:*
+${itemsList}
+──────────────────────
+📋 *Financial Summary:*
+${summaryLines}*Total Invoice: ৳${totalInvoice.toLocaleString()}*
+*Total Paid: ৳${amountPaid.toLocaleString()}*
+${historySection}
+⭐ *NET BALANCE: ৳${netBalance.toLocaleString()}*
+${transferNote}
+──────────────────────
+Thank you for shopping with us! 🙏`;
+
+        await db.addOutgoingQueue(chatId, memo, null, {}, {
+            customer_number: cleanNumber,
+            contactName: order.customer_name || 'Customer',
+            isSystemMemo: true
+        });
+
+        res.json({ success: true, message: 'Premium Memo Sent' });
+    } catch (e) {
+        console.error("[OMS] Premium Memo Error:", e);
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
 app.post('/api/ai-brain/knowledge', async (req, res) => {
     try {
-        const { title, content, type } = req.body;
-        const result = await db.addKnowledgeDocument(title, content, type);
+        const { pinned_items, ...docData } = req.body;
+        const result = await db.addKnowledgeDocument(docData);
+        if (pinned_items && Array.isArray(pinned_items)) {
+            await db.syncKnowledgePins(result.id, pinned_items);
+        }
         res.json({ success: true, id: result.id });
     } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 app.put('/api/ai-brain/knowledge/:id', async (req, res) => {
     try {
-        const { title, content, type } = req.body;
-        await db.updateKnowledgeDocument(req.params.id, title, content, type, null);
+        const { pinned_items, ...docData } = req.body;
+        // nullify embedding so it regenerates
+        await db.updateKnowledgeDocument(req.params.id, { ...docData, embedding: null });
+        if (pinned_items && Array.isArray(pinned_items)) {
+            await db.syncKnowledgePins(req.params.id, pinned_items);
+        }
         res.json({ success: true });
     } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
@@ -1010,6 +2245,63 @@ app.delete('/api/ai-brain/knowledge/:id', async (req, res) => {
     try {
         await db.deleteKnowledgeDocument(req.params.id);
         res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/ai-brain/knowledge/tune', async (req, res) => {
+    try {
+        const { text } = req.body;
+        if (!text) return res.status(400).json({ success: false, error: 'Text is required' });
+        
+        const result = await aiService.tuneKnowledge(text);
+        res.json({ success: true, refined: result.finalOutput });
+    } catch (e) { 
+        console.error("[Server] Magic Tune Error:", e);
+        res.status(500).json({ success: false, error: e.message }); 
+    }
+});
+
+app.post('/api/ai-brain/knowledge/bulk', async (req, res) => {
+    try {
+        const { csvText } = req.body;
+        const processId = `knowledge_bulk_${Date.now()}`;
+        const bulkService = require('./knowledge-bulk-service');
+        
+        io.emit('process_start', { id: processId, title: 'Bulk CSV Import', total: 100 });
+        
+        bulkService.processCSV(csvText, (msg, type, current, total) => {
+            io.emit('process_update', { id: processId, message: msg, type });
+            io.emit('process_progress', { id: processId, current, total });
+        }).then(count => {
+            io.emit('process_end', { id: processId, status: 'completed', message: `Successfully imported ${count} documents.` });
+            io.emit('knowledge_changed');
+        }).catch(err => {
+            io.emit('process_end', { id: processId, status: 'failed', message: `Import Failed: ${err.message}` });
+        });
+
+        res.json({ success: true, id: processId });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/ai-brain/knowledge/scrape', async (req, res) => {
+    try {
+        const { url } = req.body;
+        const processId = `knowledge_scrape_${Date.now()}`;
+        const bulkService = require('./knowledge-bulk-service');
+        
+        io.emit('process_start', { id: processId, title: 'Site Intelligent Scrape', total: 100 });
+        
+        bulkService.scrapeWebsiteToKnowledge(url, processId, (msg, type, current, total) => {
+            io.emit('process_update', { id: processId, message: msg, type });
+            io.emit('process_progress', { id: processId, current, total });
+        }).then(count => {
+            io.emit('process_end', { id: processId, status: 'completed', message: `Successfully ingested ${count} nodes from ${url}.` });
+            io.emit('knowledge_changed');
+        }).catch(err => {
+            io.emit('process_end', { id: processId, status: 'failed', message: `Scrape Failed: ${err.message}` });
+        });
+
+        res.json({ success: true, id: processId });
     } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
@@ -1102,8 +2394,93 @@ app.post('/api/ai-brain/vectors/sync', async (req, res) => {
     res.redirect(307, '/api/ai-brain/vectors/sync-products');
 });
 
+// --- Intelligence Evolution APIs ---
+app.post('/api/ai-brain/simulate', async (req, res) => {
+    try {
+        const { text, number } = req.body;
+        const profile = await db.getBusinessProfile();
+        const history = await db.getConversationContext(number || 'tester', 5);
+        
+        // Detailed Trace
+        const contextStr = await vectorService.getUnifiedContext(text, number);
+        const aiResult = await aiService.generateAutoReply({
+            context: contextStr,
+            history: history,
+            userMessage: text,
+            businessName: profile.company_name
+        });
+
+        res.json({
+            success: true,
+            query: text,
+            response: aiResult.reply,
+            handover: aiResult.handover,
+            action: aiResult.action,
+            context: contextStr,
+            history: history
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/intelligent-intents', async (req, res) => {
+    try {
+        const intents = await db.getIntents();
+        res.json({ success: true, intents });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/intelligent-intents', async (req, res) => {
+    try {
+        const result = await db.addIntent(req.body);
+        res.json({ success: true, id: result.id });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/intelligent-intents/:id', async (req, res) => {
+    try {
+        await db.deleteIntent(req.params.id);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // --- Database APIs (No changes needed) ---
-app.get('/customers', async (req, res) => { try { res.json(await db.getCustomers()); } catch (e) { res.status(500).json({ error: e.message }); } });
+app.get('/customers', async (req, res) => { 
+    try { 
+        const customers = await db.getCustomers();
+        // For performance, we'll only augment if specifically requested or keep it lightweight
+        // But for OMS search, accuracy is key.
+        const orders = await db.getOrders(); // Get all orders to calculate balances
+        
+        const augmented = customers.map(cust => {
+            const customerOrders = (orders || []).filter(o => o.customer_number === cust.number && !['cancelled', 'delivered', 'merged'].includes(o.status));
+            const latestOrder = customerOrders.length > 0 ? customerOrders[0] : null;
+            
+            let activeOrdersBalance = 0;
+            if (latestOrder) {
+                const total = parseFloat(latestOrder.total_amount?.toString().replace(/[^0-9.]/g, '')) || 0;
+                const paid = parseFloat(latestOrder.amount_paid) || 0;
+                activeOrdersBalance = Math.max(0, total - paid);
+            }
+
+            return {
+                ...cust,
+                previous_due: (parseFloat(cust.previous_due) || 0) + activeOrdersBalance
+            };
+        });
+
+        res.json(augmented); 
+    } catch (e) { 
+        res.status(500).json({ error: e.message }); 
+    } 
+});
 app.post('/customers', async (req, res) => {
     try {
         const result = await db.addCustomer({
@@ -1238,6 +2615,87 @@ app.get('/api/analytics/peak-hours', async (req, res) => {
         res.json(stats);
     } catch (e) {
         res.status(500).json({ error: e.message });
+    }
+});
+
+// --- AI Brain Order APIs ---
+app.get('/api/ai-brain/orders', async (req, res) => {
+    try {
+        const orders = await db.getOrders(req.query.number);
+        res.json(orders);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/ai-brain/orders', async (req, res) => {
+    try {
+        const orderData = req.body;
+        const result = await db.addOrder(orderData);
+        
+        // [CRM EVOLUTION] CRM Sync Hook: Automatically update customer profile from order
+        if (orderData.customer_number) {
+            const amount = parseFloat(orderData.total_amount) || 0;
+            
+            // 1. Recalculate LTV and ensure stage is 'customer'
+            await db.recalculateCustomerLTV(orderData.customer_number);
+            
+            // 2. Enrich profile with shipping info (if available)
+            if (orderData.shipping_details) {
+                const { address, city, email, name } = orderData.shipping_details;
+                await db.updateCustomerIntel(orderData.customer_number, {
+                    address, city, email, name,
+                    lifecycle_stage: 'customer'
+                });
+            }
+            
+            io.emit('customer_intel_updated', { number: orderData.customer_number, action: 'order_sync' });
+        }
+
+        res.json({ success: true, id: result.id });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.patch('/api/ai-brain/orders/:id/payment', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await db.updateOrderPayment(id, req.body);
+        res.json(result);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Finance & Expense APIs ──────────────────────────────────────────
+app.get('/api/ai-brain/expenses', async (req, res) => {
+    try {
+        const { from, to } = req.query;
+        const expenses = await db.getExpenses(from, to);
+        res.json({ success: true, expenses });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
+});
+
+app.post('/api/ai-brain/expenses', async (req, res) => {
+    try {
+        const result = await db.addExpense(req.body);
+        io.emit('expenses_updated');
+        res.json({ success: true, id: result.id });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/ai-brain/expenses/:id', async (req, res) => {
+    try {
+        await db.deleteExpense(req.params.id);
+        io.emit('expenses_updated');
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/ai-brain/finance-overview', async (req, res) => {
+    try {
+        const { from, to } = req.query;
+        const stats = await db.getFinanceOverview(from, to);
+        res.json({ success: true, stats });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
     }
 });
 
@@ -1468,6 +2926,86 @@ app.get('/api/contacts/stats', async (req, res) => {
     }
 });
 
+app.get('/api/contacts/profile/:number', async (req, res) => {
+    try {
+        const number = req.params.number;
+        const contact = await db.getCustomerByNumber(number);
+        if (!contact) return res.status(404).json({ error: 'Contact not found' });
+        
+        const contactHistory = await db.getContactHistory(contact.id);
+        const orders = await db.getOrders(number);
+        const financialDNA = await db.getCustomerFinancialDNA(number);
+        const financialLedger = await db.getCustomerFinancialLedger(number);
+        
+        // Dynamic Balance Calculation: Take only the LATEST active order's balance to avoid double-counting
+        const activeOrders = (orders || []).filter(o => !['cancelled', 'delivered', 'merged'].includes(o.status));
+        const latestOrder = activeOrders.length > 0 ? activeOrders[0] : null;
+        
+        let activeOrdersBalance = 0;
+        if (latestOrder) {
+            const total = parseFloat(latestOrder.total_amount?.toString().replace(/[^0-9.]/g, '')) || 0;
+            const paid = parseFloat(latestOrder.amount_paid) || 0;
+            activeOrdersBalance = Math.max(0, total - paid);
+        }
+
+        // Augment contact with real-time active balance
+        contact.previous_due = (parseFloat(contact.previous_due) || 0) + activeOrdersBalance;
+        
+        if (contact) {
+            contact.phone = contact.number; // Compatibility for frontend
+        }
+        
+        res.json({
+            success: true,
+            contact,
+            history: contactHistory.history, // Extract only the history array
+            orders,
+            financialDNA,
+            financialLedger
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/contacts/financial-dna/:number', async (req, res) => {
+    try {
+        const dna = await db.getCustomerFinancialDNA(req.params.number);
+        res.json({ success: true, dna });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/contacts/financial-ledger/:number', async (req, res) => {
+    try {
+        const ledger = await db.getCustomerFinancialLedger(req.params.number);
+        res.json({ success: true, ledger });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/contacts/:number/addresses', async (req, res) => {
+    try {
+        const { action, addressData } = req.body;
+        const result = await db.manageSavedAddress(req.params.number, action, addressData);
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.put('/api/contacts/:id/tags', async (req, res) => {
+    try {
+        const { tags } = req.body;
+        await db.updateCustomerTags(req.params.id, tags);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 app.get('/api/contacts/:id/history', async (req, res) => {
     try {
         const history = await db.getContactHistory(req.params.id);
@@ -1486,7 +3024,7 @@ app.get('/api/contacts/history-by-phone/:phone', async (req, res) => {
     }
 });
 
-// --- AI Template Generation ---
+// --- AI Template & Content Refinement ---
 app.post('/api/ai/generate', async (req, res) => {
     const { prompt, category, useSpintax } = req.body;
     if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
@@ -1496,6 +3034,19 @@ app.post('/api/ai/generate', async (req, res) => {
         res.json({ success: true, content });
     } catch (err) {
         console.error('[Hub] AI error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/ai-brain/knowledge/tune', async (req, res) => {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: 'Text is required' });
+
+    try {
+        const refined = await aiService.tuneKnowledge(text);
+        res.json({ success: true, refined });
+    } catch (err) {
+        console.error('[Hub] AI Knowledge Tune error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -2009,6 +3560,27 @@ app.get('/api/ai-brain/analytics', async (req, res) => {
     }
 });
 
+app.get('/api/ai-brain/intelligence-stats', async (req, res) => {
+    try {
+        const stats = await db.getIntelligenceStats();
+        // Include very recent AI logs for the heartbeat feed
+        const recentLogs = await db.getAILogs(5, 0);
+        res.json({ success: true, stats, heartbeat: recentLogs.logs });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/ai-brain/executive-brief', async (req, res) => {
+    try {
+        const stats = await db.getIntelligenceStats();
+        const brief = await aiService.generateIntelligenceBrief(stats);
+        res.json({ success: true, brief });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 app.get('/api/ai-brain/logs', async (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const offset = parseInt(req.query.offset) || 0;
@@ -2017,6 +3589,116 @@ app.get('/api/ai-brain/logs', async (req, res) => {
         res.json({ success: true, ...result });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/ai-brain/intent-analytics', async (req, res) => {
+    try {
+        const analytics = await db.getAIIntentAnalytics();
+        res.json({ success: true, analytics });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+// --- AI API Configuration Endpoints ---
+app.get('/api/ai-brain/configs', async (req, res) => {
+    try {
+        const configs = await db.getAIConfigs();
+        res.json({ success: true, configs });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.post('/api/ai-brain/configs', async (req, res) => {
+    try {
+        const result = await db.addAIConfig(req.body);
+        res.json({ success: true, id: result.id });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.put('/api/ai-brain/configs/:id', async (req, res) => {
+    try {
+        await db.updateAIConfig(req.params.id, req.body);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.delete('/api/ai-brain/configs/:id', async (req, res) => {
+    try {
+        await db.deleteAIConfig(req.params.id);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/ai-brain/configs/:id/logs', async (req, res) => {
+    try {
+        const limit = parseInt(req.query.limit) || 50;
+        const offset = parseInt(req.query.offset) || 0;
+        const result = await db.getAIConfigLogs(req.params.id, limit, offset);
+        res.json({ success: true, ...result });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/ai-brain/usage-stats', async (req, res) => {
+    try {
+        const days = parseInt(req.query.days) || 7;
+        const stats = await db.getAIUsageStats(days);
+        const configStats = await db.getAIConfigStats();
+        res.json({ success: true, stats, configStats });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.post('/api/ai-brain/simulate', async (req, res) => {
+    try {
+        const { text, number } = req.body;
+        if (!text || !number) return res.status(400).json({ success: false, error: 'Text and number are required' });
+
+        const profile = await db.getBusinessProfile();
+        const enhancedContext = await db.getEnhancedConversationContext(number, 10);
+        const contextStr = await vectorService.getUnifiedContext(text, number);
+
+        const aiResult = await aiService.generateAutoReply({
+            context: contextStr,
+            history: enhancedContext.fullContext,
+            userMessage: text,
+            businessName: profile.company_name,
+            customerNumber: number
+        });
+
+        res.json({
+            success: true,
+            response: aiResult.reply,
+            context: contextStr,
+            action: aiResult.action || null,
+            handover: aiResult.handover,
+            intel: aiResult.intel
+        });
+    } catch (error) {
+        console.error("AI Simulation Error:", error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.post('/api/ai-brain/tune-profile', async (req, res) => {
+    try {
+        const { text } = req.body;
+        if (!text) return res.status(400).json({ success: false, error: 'Text is required' });
+        const tunedText = await aiService.tuneProfileOverview(text);
+        res.json({ success: true, tunedText });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
     }
 });
 
@@ -2075,93 +3757,300 @@ const ensurePortAvailable = async (port) => {
     if (process.platform !== 'win32') return;
 
     try {
-        console.log(`[Server] 🔍 Checking port ${port} availability...`);
-        // Find PID holding the port
+        const currentPid = process.pid;
+        const parentPid = process.ppid;
         const findCmd = `netstat -ano | findstr :${port} | findstr LISTENING`;
         const output = execSync(findCmd, { encoding: 'utf8' }).trim();
         
         if (output) {
-            // Extract PID (last column)
             const lines = output.split('\n');
             const pids = new Set();
             lines.forEach(line => {
                 const parts = line.trim().split(/\s+/);
                 const pid = parts[parts.length - 1];
-                if (pid && pid !== '0') pids.add(pid);
+                if (pid && pid !== '0' && pid !== String(currentPid) && pid !== String(parentPid)) {
+                    pids.add(pid);
+                }
             });
 
             for (const pid of pids) {
                 console.log(`[Server] ⚠️ Port ${port} is held by PID ${pid}. Attempting cleanup...`);
-                // Force kill if it's a node/chrome process associated with our app
-                const killCmd = `powershell -Command "Stop-Process -Id ${pid} -Force -ErrorAction SilentlyContinue"`;
-                execSync(killCmd, { stdio: 'ignore' });
+                try {
+                    execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore' });
+                } catch (e) {}
             }
             
-            // Wait for OS to release the socket
-            await new Promise(r => setTimeout(r, 2000));
+            if (pids.size > 0) {
+                await new Promise(r => setTimeout(r, 1000));
+            }
         }
-    } catch (e) {
-        // execSync throws if findstr finds nothing, which is good
-    }
+    } catch (e) {}
 };
 
+// --- HUMAN-IN-THE-LOOP (HITL) AI CACHE CONTROL APIs ---
+app.get('/api/ai/cache-clusters', async (req, res) => {
+    try {
+        const clusters = await db.getCacheClusters('default');
+        res.json({ success: true, clusters });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get('/api/ai/cache-analytics', async (req, res) => {
+    try {
+        const analytics = await db.getCacheAnalytics('default');
+        res.json({ success: true, ...analytics });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.put('/api/ai/cache-clusters/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { responseText, isGolden, intentKey } = req.body;
+        const result = await db.updateCacheResponse(id, responseText, isGolden, intentKey);
+        res.json({ success: true, ...result });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/ai/cache-clusters/reassign', async (req, res) => {
+    try {
+        const { id, targetIntent } = req.body;
+        const result = await db.reassignCacheIntent(id, targetIntent);
+        res.json({ success: true, ...result });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.delete('/api/ai/cache-clusters/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const result = await db.deleteCacheItem(id);
+        res.json({ success: true, ...result });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.post('/api/ai/cache-clusters/add-query', async (req, res) => {
+    try {
+        const { intentKey, pureQuery, responseText, isGolden } = req.body;
+        if (!intentKey || !pureQuery) {
+            return res.status(400).json({ success: false, error: 'intentKey and pureQuery are required' });
+        }
+        await vectorService.setSemanticCachedResponse(
+            pureQuery,
+            intentKey,
+            typeof responseText === 'string' ? JSON.parse(responseText) : (responseText || { reply: 'Default approved answer.' }),
+            'default'
+        );
+        if (isGolden) {
+            const cleanQuery = pureQuery.toLowerCase().replace(/[^\w\s\u0980-\u09FF]/gi, '').trim();
+            const queryHash = crypto.createHash('md5').update(`default_${cleanQuery}`).digest('hex');
+            const item = await db.getCachedAIResponse(queryHash);
+            if (item) {
+                await db.updateCacheResponse(item.id, item.response_text, 1, intentKey);
+            }
+        }
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// ── Next-Gen Enterprise Cache Control Studio APIs ──────────────────────────
+
+// 1. Live Cache Simulator
+app.post('/api/ai/cache-clusters/test-query', async (req, res) => {
+    try {
+        const { queryText } = req.body;
+        if (!queryText) return res.status(400).json({ success: false, error: 'queryText is required' });
+
+        const DYNAMIC_MATH_PATTERN = /(\d+(\.\d+)?\s*(kg|কেজি|gm|g|গ্রাম|পিস|টি|প্যাক|কেজির|টাকা|হিসাব|দাম কত|মোট কত|কত আসবে|কত টাকা|কত দাম|হিসেব|কয় টাকা|কোয়ান্টিটি|পরিমাণ)|হিসাব|ক্যালকুলেট|হিসেব|মোট কত|দাম কত আসবে|ক্যালকুলেশন)/i;
+        const hasNumbersWithUnits = /\d+/.test(queryText) && /(কেজি|kg|gm|গ্রাম|টাকা|দাম|পিস|টি|কত)/i.test(queryText);
+        
+        if (DYNAMIC_MATH_PATTERN.test(queryText) || hasNumbersWithUnits) {
+            return res.json({
+                success: true,
+                isMathQuery: true,
+                hit: false,
+                status: 'BYPASS_LIVE_MATH',
+                message: '🛑 Dynamic calculation detected! All math/unit queries BYPASS CACHE for 100% accurate AI calculation.'
+            });
+        }
+
+        const emb = await vectorService.generateEmbedding(queryText);
+        const thresholdStr = await db.getSetting('cache_similarity_threshold');
+        const threshold = thresholdStr ? parseFloat(thresholdStr) : 0.95;
+        const hit = await vectorService.getSemanticCachedResponse(queryText, null, 'default', emb);
+
+        if (hit) {
+            return res.json({
+                success: true,
+                isMathQuery: false,
+                hit: true,
+                status: 'CACHE_HIT',
+                thresholdUsed: threshold,
+                response: hit
+            });
+        }
+
+        res.json({
+            success: true,
+            isMathQuery: false,
+            hit: false,
+            status: 'CACHE_MISS',
+            thresholdUsed: threshold,
+            message: 'No 95%+ vector match found in cache. Will execute Live AI RAG.'
+        });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// 2. AI Auto-Synonym Generator
+app.post('/api/ai/cache-clusters/generate-synonyms', async (req, res) => {
+    try {
+        const { intentKey, sampleQuery } = req.body;
+        const prompt = `Generate 5 natural Bengali customer question phrasings for customer support intent "${intentKey}" based on sample query "${sampleQuery || ''}". Output pure JSON array of strings ONLY: ["q1", "q2", "q3", "q4", "q5"]`;
+        const aiService = require('./ai-service');
+        const result = await aiService.executeAITask('GENERAL', prompt, 'Respond only with a JSON array.');
+        let questions = [];
+        try {
+            const jsonStr = result.replace(/```json|```/g, '').trim();
+            questions = JSON.parse(jsonStr);
+        } catch (e) {
+            questions = [
+                `${sampleQuery || intentKey} সম্পর্কিত তথ্য দিন`,
+                `এটার নিয়ম কি?`,
+                `ডিটেইলস জানাবেন?`
+            ];
+        }
+        res.json({ success: true, questions });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// 3. Bulk Golden Lock
+app.post('/api/ai/cache-clusters/bulk-golden', async (req, res) => {
+    try {
+        const { intentKey, isGolden } = req.body;
+        if (!intentKey) return res.status(400).json({ success: false, error: 'intentKey required' });
+        await db.runQuery('UPDATE ai_response_cache SET is_golden = ? WHERE intent_key = ?', [isGolden ? 1 : 0, intentKey]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// 4. Sensitivity Settings
+app.get('/api/ai/cache-settings', async (req, res) => {
+    try {
+        const threshold = await db.getSetting('cache_similarity_threshold') || '0.95';
+        const ttl = await db.getSetting('cache_ttl_mode') || 'PERMANENT';
+        res.json({ success: true, threshold: parseFloat(threshold), ttl });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.put('/api/ai/cache-settings', async (req, res) => {
+    try {
+        const { threshold, ttl } = req.body;
+        if (threshold !== undefined) await db.saveSettings({ cache_similarity_threshold: String(threshold) });
+        if (ttl !== undefined) await db.saveSettings({ cache_ttl_mode: String(ttl) });
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+// 5. Uncached Real Customer Query Feed ("AI Miss-to-Cache Stream")
+app.get('/api/ai/cache-uncached-queries', async (req, res) => {
+    try {
+        const logs = await db.allQuery(
+            `SELECT id, customer_number, query, context, response_text, created_at 
+             FROM ai_logs 
+             WHERE context NOT LIKE '%[SEMANTIC CACHE HIT]%' 
+             ORDER BY id DESC LIMIT 20`
+        );
+        res.json({ success: true, uncached: logs || [] });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
 if (process.env.NODE_ENV !== 'test') {
+    let retryAttempts = 0;
+    const maxRetryAttempts = 10;
+
+    // 🛡️ Graceful Nodemon Restart & Signal Handlers (Frees port 3001 instantly)
+    process.once('SIGUSR2', () => {
+        console.log('[Server] 🔄 Nodemon restart signal received. Releasing port 3001...');
+        try { server.close(); } catch (e) {}
+        process.kill(process.pid, 'SIGUSR2');
+    });
+
+    process.on('SIGINT', () => {
+        console.log('[Server] 🛑 Shutdown signal received. Releasing port 3001...');
+        try { server.close(); } catch (e) {}
+        process.exit(0);
+    });
+
     const startServer = async () => {
         try {
             await ensurePortAvailable(PORT);
             
-            server.listen(PORT, async () => {
-                console.log(`API Server running on port ${PORT}`);
-                initScheduler(io, db);
-                require('./crawler-service').start();
+            const listenWithRetry = () => {
+                server.listen(PORT, async () => {
+                    console.log(`API Server running on port ${PORT}`);
+                    retryAttempts = 0; // Reset counter on clean bind
+                    initScheduler(io, db);
+                    require('./crawler-service').start();
 
-                // Recover stuck campaigns
-                try {
-                    await campaignService.recoverCampaigns();
-                } catch (e) {
-                    console.error('Failed to recover campaigns:', e);
-                }
-
-                // --- Daily SIS Cleanup Service (Runs at 3 AM) ---
-                const cron = require('node-cron');
-                cron.schedule('0 3 * * *', async () => {
-                    console.log('[SIS] Starting daily media cleanup...');
+                    // Recover stuck campaigns
                     try {
-                        const dbRef = require('./db'); // Ensure direct ref
-                        const assets = await dbRef.dbAll(`SELECT * FROM media_assets WHERE is_protected = 0`);
-                        const now = Date.now();
-                        const maxAge = 30 * 24 * 60 * 60 * 1000; // 30 Days
+                        await campaignService.recoverCampaigns();
+                    } catch (e) {
+                        console.error('Failed to recover campaigns:', e);
+                    }
 
-                        for (const asset of assets) {
-                            const filePath = path.join(__dirname, asset.url.replace('/uploads/', 'uploads/'));
-                            if (fs.existsSync(filePath)) {
-                                const stats = fs.statSync(filePath);
-                                if (now - stats.mtimeMs > maxAge) {
-                                    console.log(`[SIS] Deleting old unprotected asset: ${asset.url}`);
-                                    fs.unlinkSync(filePath);
+                    // --- Daily SIS Cleanup Service (Runs at 3 AM) ---
+                    const cron = require('node-cron');
+                    cron.schedule('0 3 * * *', async () => {
+                        console.log('[SIS] Starting daily media cleanup...');
+                        try {
+                            const dbRef = require('./db');
+                            const assets = await dbRef.dbAll(`SELECT * FROM media_assets WHERE is_protected = 0`);
+                            const now = Date.now();
+                            const maxAge = 30 * 24 * 60 * 60 * 1000;
+
+                            for (const asset of assets) {
+                                const filePath = path.join(__dirname, asset.url.replace('/uploads/', 'uploads/'));
+                                if (fs.existsSync(filePath)) {
+                                    const stats = fs.statSync(filePath);
+                                    if (now - stats.mtimeMs > maxAge) {
+                                        console.log(`[SIS] Deleting old unprotected asset: ${asset.url}`);
+                                        fs.unlinkSync(filePath);
+                                        await dbRef.dbRun(`DELETE FROM media_assets WHERE hash = ?`, [asset.hash]);
+                                    }
+                                } else {
                                     await dbRef.dbRun(`DELETE FROM media_assets WHERE hash = ?`, [asset.hash]);
                                 }
-                            } else {
-                                // Cleanup DB if file missing
-                                await dbRef.dbRun(`DELETE FROM media_assets WHERE hash = ?`, [asset.hash]);
                             }
+                        } catch (err) {
+                            console.error('[SIS] Cleanup Error:', err);
                         }
-                    } catch (err) {
-                        console.error('[SIS] Cleanup Error:', err);
-                    }
+                    });
                 });
-            });
+            };
 
-            server.on('error', (err) => {
+            server.on('error', async (err) => {
                 if (err.code === 'EADDRINUSE') {
-                    console.error(`[Server] 🚨 Port ${PORT} is still in use after cleanup attempt.`);
-                    process.exit(1); 
+                    retryAttempts++;
+                    console.warn(`[Server] ⚠️ Port ${PORT} in use (Attempt ${retryAttempts}/${maxRetryAttempts}). Retrying in 1.5s after OS release...`);
+                    await ensurePortAvailable(PORT);
+                    if (retryAttempts < maxRetryAttempts) {
+                        setTimeout(() => {
+                            try {
+                                server.close(() => {
+                                    listenWithRetry();
+                                });
+                            } catch (e) {
+                                try { listenWithRetry(); } catch (err2) {}
+                            }
+                        }, 1500);
+                    } else {
+                        console.error(`[Server] 🚨 Critical: Could not bind port ${PORT} after ${maxRetryAttempts} retries.`);
+                    }
                 }
             });
 
+            listenWithRetry();
         } catch (err) {
             console.error('[Server] Failed to start:', err);
-            process.exit(1);
         }
     };
 

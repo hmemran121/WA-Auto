@@ -30,7 +30,9 @@ import {
     Strikethrough,
     Code,
     Copy,
-    Shuffle
+    Shuffle,
+    BarChart3,
+    Plus
 } from 'lucide-react';
 import { MessageLog, Contact, Template } from '../types';
 import { useModal } from '../services/useModal';
@@ -164,6 +166,10 @@ const ChatBox: React.FC<ChatBoxProps> = ({ logs, contacts, onSendMessage, onSend
     const [loadingHistory, setLoadingHistory] = useState(false);
     const [hasMoreHistory, setHasMoreHistory] = useState(true);
     const [aiStatus, setAiStatus] = useState({ ai_paused: 0, handover_requested: 0 });
+    const [profileData, setProfileData] = useState<any>(null);
+    const [isFetchingProfile, setIsFetchingProfile] = useState(false);
+    const [availableTags, setAvailableTags] = useState<string[]>([]);
+    const [showTagPicker, setShowTagPicker] = useState(false);
     const scrollRef = useRef<HTMLDivElement>(null);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const recordingInterval = useRef<any>(null);
@@ -308,17 +314,48 @@ const ChatBox: React.FC<ChatBoxProps> = ({ logs, contacts, onSendMessage, onSend
             fetchAIStatus(selectedChat);
         }
     };
+    const fetchProfile = async (number: string) => {
+        setIsFetchingProfile(true);
+        try {
+            // Fetch Profile Data
+            const res = await fetch(`http://localhost:3001/api/contacts/profile/${encodeURIComponent(number)}`);
+            const data = await res.json();
+            if (data.success) {
+                setProfileData(data);
+            }
 
-    // Auto-fetch: if a chat is selected but has no messages, trigger initial history load
+            // Fetch AI Tagging Rules to extract available tags
+            const settingsRes = await fetch('http://localhost:3001/api/settings');
+            const settingsData = await settingsRes.json();
+            if (settingsData.success && settingsData.settings.ai_tagging_rules) {
+                const rules = settingsData.settings.ai_tagging_rules;
+                const extractedTags = Array.from(new Set(rules.match(/#(\w+)/g) || [])).map((t: any) => t.replace('#', ''));
+                setAvailableTags(extractedTags as string[]);
+            }
+        } catch (err) {
+            console.error('Failed to fetch profile/settings:', err);
+        } finally {
+            setIsFetchingProfile(false);
+        }
+    };
+
+    useEffect(() => {
+        if (showContactInfo && selectedChat) {
+            fetchProfile(selectedChat);
+        }
+    }, [showContactInfo, selectedChat]);
     useEffect(() => {
         if (!selectedChat || !socket) return;
         const currentMessages = chats[selectedChat] || [];
-        if (currentMessages.length === 0) {
-            // No messages at all — fetch from WhatsApp directly
-            console.log('[ChatBox] Empty chat, auto-fetching history for', selectedChat);
+        
+        // If we have very few messages for this chat (e.g. < 20),
+        // proactively fetch the latest history from the database to fill the gap.
+        // This solves the issue where old messages aren't visible unless you scroll.
+        if (currentMessages.length < 20) {
+            console.log(`[ChatBox] Proactively fetching history for ${selectedChat} (Current: ${currentMessages.length})`);
             setLoadingHistory(true);
             scrollAnchoringRef.current = null;
-            socket.emit('fetch-more-history', { chatId: selectedChat, lastMsgId: undefined, limit: 20 });
+            socket.emit('fetch-more-history', { chatId: selectedChat, lastMsgId: undefined, limit: 40 });
         }
     }, [selectedChat, socket]);
 
@@ -1500,53 +1537,242 @@ const ChatBox: React.FC<ChatBoxProps> = ({ logs, contacts, onSendMessage, onSend
                                 </div>
 
                                 <div className="space-y-6">
-                                    <div className="bg-white/50 p-5 rounded-2xl border border-white shadow-sm space-y-3">
-                                        <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest">About</h4>
-                                        <p className="text-gray-600 text-sm leading-relaxed font-medium capitalize">
-                                            Premium WhatsApp User
-                                        </p>
-                                    </div>
-
-                                    <div className="space-y-3">
-                                        <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-2">Privacy & Settings</h4>
-                                        <div className="space-y-2">
-                                            <button className="w-full flex items-center justify-between p-4 rounded-2xl hover:bg-white transition-all group border border-transparent hover:border-white hover:shadow-sm">
-                                                <div className="flex items-center gap-3 text-gray-700">
-                                                    <div className="p-2 bg-blue-50 rounded-lg text-blue-500">
-                                                        <Bell size={18} />
-                                                    </div>
-                                                    <span className="text-sm font-bold">Mute Notifications</span>
-                                                </div>
-                                                <div className="w-10 h-6 bg-gray-200 rounded-full relative p-1 transition-colors group-hover:bg-wa-teal/20">
-                                                    <div className="w-4 h-4 bg-white rounded-full shadow-md"></div>
-                                                </div>
-                                            </button>
-                                            <button className="w-full flex items-center justify-between p-4 rounded-2xl hover:bg-white transition-all group border border-transparent hover:border-white hover:shadow-sm">
-                                                <div className="flex items-center gap-3 text-gray-700">
-                                                    <div className="p-2 bg-purple-50 rounded-lg text-purple-500">
-                                                        <Clock size={18} />
-                                                    </div>
-                                                    <span className="text-sm font-bold">Ephemeral Messages</span>
-                                                </div>
-                                                <span className="text-xs font-black text-gray-400">OFF</span>
-                                            </button>
+                                    {isFetchingProfile ? (
+                                        <div className="flex flex-col items-center justify-center py-12 space-y-4">
+                                            <div className="w-8 h-8 border-4 border-wa-teal border-t-transparent rounded-full animate-spin"></div>
+                                            <p className="text-xs font-black text-gray-400 uppercase tracking-widest">Fetching Intel...</p>
                                         </div>
-                                    </div>
+                                    ) : profileData?.contact ? (
+                                        <>
+                                            {/* Intelligence Overview */}
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div className="bg-wa-teal p-4 rounded-2xl shadow-lg shadow-wa-teal/20 text-white flex flex-col items-center">
+                                                    <p className="text-[8px] font-black uppercase tracking-widest opacity-70 mb-1">Funnel Stage</p>
+                                                    <span className="text-xs font-black uppercase">{profileData.contact.lifecycle_stage || 'Lead'}</span>
+                                                </div>
+                                                <div className="bg-white p-4 rounded-2xl border border-wa-teal/20 flex flex-col items-center box-border">
+                                                    <p className="text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Sentiment</p>
+                                                    <div className="flex items-center gap-2">
+                                                        <div className={`w-1.5 h-1.5 rounded-full animate-pulse ${profileData.contact.sentiment_score > 70 ? 'bg-emerald-500' : 'bg-amber-500'}`}></div>
+                                                        <span className={`text-xs font-black ${profileData.contact.sentiment_score > 70 ? 'text-emerald-600' : 'text-amber-600'}`}>{profileData.contact.sentiment_score || 100}%</span>
+                                                    </div>
+                                                </div>
+                                            </div>
 
-                                    <div className="space-y-3 pt-4">
-                                        <button className="w-full flex items-center gap-4 p-4 rounded-2xl text-rose-500 hover:bg-rose-50/50 transition-all font-bold group border border-transparent hover:border-rose-100">
-                                            <div className="p-2 bg-rose-50 rounded-lg text-rose-500 group-hover:scale-110 transition-transform">
-                                                <Ban size={18} />
+                                            {/* 📊 Behavioral Gauges (Dynamic Indicators) */}
+                                            <div className="p-5 bg-gradient-to-br from-slate-50 to-white rounded-3xl border border-gray-100 shadow-sm space-y-5">
+                                                <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-1">Behavioral Intelligence</h4>
+                                                
+                                                {/* Interest Meter */}
+                                                <div className="space-y-2">
+                                                    <div className="flex justify-between items-center px-1">
+                                                        <span className="text-[10px] font-bold text-gray-600">Interest Meter</span>
+                                                        <span className="text-[10px] font-black text-wa-teal">{profileData.contact.interest_score || 0}%</span>
+                                                    </div>
+                                                    <div className="h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                                                        <motion.div 
+                                                            initial={{ width: 0 }}
+                                                            animate={{ width: `${profileData.contact.interest_score || 0}%` }}
+                                                            className="h-full bg-gradient-to-r from-wa-teal to-emerald-400 rounded-full"
+                                                        />
+                                                    </div>
+                                                </div>
+
+                                                <div className="grid grid-cols-2 gap-4">
+                                                    {/* Trust Score */}
+                                                    <div className="space-y-2">
+                                                        <p className="text-[9px] font-black text-gray-400 uppercase tracking-tight">Trust Score</p>
+                                                        <div className="flex items-end gap-1">
+                                                            <span className="text-lg font-black text-indigo-600 leading-none">{profileData.contact.loyalty_score || 0}%</span>
+                                                            <div className="flex gap-0.5 mb-1">
+                                                                {[...Array(5)].map((_, i) => (
+                                                                    <div key={i} className={`w-1 h-3 rounded-full ${i < ((profileData.contact.loyalty_score || 0) / 20) ? 'bg-indigo-500' : 'bg-gray-100'}`} />
+                                                                ))}
+                                                            </div>
+                                                        </div>
+                                                    </div>
+
+                                                    {/* Price Sensitivity */}
+                                                    <div className="space-y-2">
+                                                        <p className="text-[9px] font-black text-gray-400 uppercase tracking-tight">Price Sensitivity</p>
+                                                        <div className="flex items-center gap-2">
+                                                            <div className={`px-2 py-1 rounded-lg text-[10px] font-black uppercase tracking-tighter ${
+                                                                (profileData.contact.price_sensitivity_score || 0) > 60 ? 'bg-rose-50 text-rose-500 border border-rose-100' : 
+                                                                (profileData.contact.price_sensitivity_score || 0) > 30 ? 'bg-amber-50 text-amber-600 border border-amber-100' :
+                                                                'bg-emerald-50 text-emerald-600 border border-emerald-100'
+                                                            }`}>
+                                                                {(profileData.contact.price_sensitivity_score || 0) > 60 ? 'Hard Bargainer' : 
+                                                                 (profileData.contact.price_sensitivity_score || 0) > 30 ? 'Value Seeker' : 'Premium'}
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
                                             </div>
-                                            <span>Block {activeChat?.name}</span>
-                                        </button>
-                                        <button className="w-full flex items-center gap-4 p-4 rounded-2xl text-rose-500 hover:bg-rose-50/50 transition-all font-bold group border border-transparent hover:border-rose-100">
-                                            <div className="p-2 bg-rose-50 rounded-lg text-rose-500 group-hover:scale-110 transition-transform">
-                                                <Trash2 size={18} />
+
+                                            {/* Revenue / LTV */}
+                                            <div className="bg-gradient-to-br from-gray-900 to-slate-800 p-5 rounded-2xl shadow-xl border border-slate-700">
+                                                <div className="flex justify-between items-center mb-1">
+                                                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-[0.2em]">Customer Lifetime Value</p>
+                                                    <Zap size={14} className="text-amber-400 animate-pulse" />
+                                                </div>
+                                                <p className="text-2xl font-black text-white">৳{profileData.contact.lifetime_value || 0}</p>
                                             </div>
-                                            <span>Delete Conversation</span>
-                                        </button>
-                                    </div>
+
+                                            {/* AI Infinite Memory (Summary) */}
+                                            {profileData.contact.ai_memory_summary && (
+                                                <div className="bg-emerald-50/50 p-4 rounded-2xl border border-emerald-100/50">
+                                                    <div className="flex items-center gap-2 mb-2">
+                                                        <Clock size={12} className="text-emerald-500" />
+                                                        <h4 className="text-[10px] font-black text-emerald-600 uppercase tracking-widest">AI Context Memory</h4>
+                                                    </div>
+                                                    <div className="text-[11px] font-medium text-emerald-800 leading-relaxed italic">
+                                                        {profileData.contact.ai_memory_summary.split('\n').map((line: string, i: number) => (
+                                                            <div key={i} className="mb-1 last:mb-0 flex gap-2">
+                                                                <span className="text-emerald-300">•</span>
+                                                                <span>{line.replace(/^[•\-\*]\s*/, '')}</span>
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {/* Tag Manager */}
+                                            <div className="space-y-3">
+                                                <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-2">Knowledge Tags</h4>
+                                                <div className="flex flex-wrap gap-2 p-2 bg-gray-50/50 rounded-2xl border border-dashed border-gray-200 relative">
+                                                    {(profileData.contact.tags ? (typeof profileData.contact.tags === 'string' ? JSON.parse(profileData.contact.tags) : profileData.contact.tags) : []).map((tag: string, i: number) => (
+                                                        <span key={i} className="flex items-center gap-1.5 bg-white border border-gray-200 px-3 py-1.5 rounded-xl text-[10px] font-black text-gray-600 shadow-sm group">
+                                                            #{tag}
+                                                            <button 
+                                                                onClick={async () => {
+                                                                    const currentTags = typeof profileData.contact.tags === 'string' ? JSON.parse(profileData.contact.tags) : profileData.contact.tags;
+                                                                    const nextTags = currentTags.filter((t: string) => t !== tag);
+                                                                    try {
+                                                                        await fetch(`http://localhost:3001/api/contacts/${profileData.contact.id}/tags`, {
+                                                                            method: 'PUT',
+                                                                            headers: { 'Content-Type': 'application/json' },
+                                                                            body: JSON.stringify({ tags: JSON.stringify(nextTags) })
+                                                                        });
+                                                                        setProfileData({ ...profileData, contact: { ...profileData.contact, tags: JSON.stringify(nextTags) } });
+                                                                    } catch (e) {
+                                                                        console.error('Failed to remove tag', e);
+                                                                    }
+                                                                }}
+                                                                className="opacity-0 group-hover:opacity-100 text-rose-400 hover:text-rose-600 transition-all"
+                                                            >
+                                                                <X size={10} />
+                                                            </button>
+                                                        </span>
+                                                    ))}
+                                                    
+                                                    <div className="relative">
+                                                        <button 
+                                                            onClick={(e) => {
+                                                                e.stopPropagation();
+                                                                setShowTagPicker(!showTagPicker);
+                                                            }}
+                                                            className="flex items-center gap-1.5 bg-wa-teal/5 border border-wa-teal/20 px-3 py-1.5 rounded-xl text-[10px] font-black text-wa-teal hover:bg-wa-teal hover:text-white transition-all shadow-sm"
+                                                        >
+                                                            <Plus size={10} />
+                                                            Add Tag
+                                                        </button>
+
+                                                        <AnimatePresence>
+                                                            {showTagPicker && (
+                                                                <>
+                                                                    <div className="fixed inset-0 z-40" onClick={() => setShowTagPicker(false)} />
+                                                                    <motion.div
+                                                                        initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                                                                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                                                                        exit={{ opacity: 0, scale: 0.95 }}
+                                                                        className="absolute left-0 top-full mt-2 w-48 bg-white rounded-2xl shadow-2xl border border-gray-100 z-50 overflow-hidden py-2"
+                                                                    >
+                                                                        <div className="px-3 py-2 border-b border-gray-50 mb-1">
+                                                                            <p className="text-[9px] font-black text-gray-400 uppercase tracking-widest">Available from AI Rules</p>
+                                                                        </div>
+                                                                        <div className="max-h-48 overflow-y-auto custom-scrollbar">
+                                                                            {availableTags.length > 0 ? (
+                                                                                availableTags
+                                                                                    .filter(tag => !(profileData.contact.tags ? (typeof profileData.contact.tags === 'string' ? JSON.parse(profileData.contact.tags) : profileData.contact.tags) : []).includes(tag))
+                                                                                    .map((tag, idx) => (
+                                                                                        <button
+                                                                                            key={idx}
+                                                                                            onClick={async () => {
+                                                                                                const currentTags = profileData.contact.tags ? (typeof profileData.contact.tags === 'string' ? JSON.parse(profileData.contact.tags) : profileData.contact.tags) : [];
+                                                                                                const nextTags = [...currentTags, tag];
+                                                                                                try {
+                                                                                                    await fetch(`http://localhost:3001/api/contacts/${profileData.contact.id}/tags`, {
+                                                                                                        method: 'PUT',
+                                                                                                        headers: { 'Content-Type': 'application/json' },
+                                                                                                        body: JSON.stringify({ tags: JSON.stringify(nextTags) })
+                                                                                                    });
+                                                                                                    setProfileData({ ...profileData, contact: { ...profileData.contact, tags: JSON.stringify(nextTags) } });
+                                                                                                    setShowTagPicker(false);
+                                                                                                } catch (e) {
+                                                                                                    console.error('Failed to add tag', e);
+                                                                                                }
+                                                                                            }}
+                                                                                            className="w-full text-left px-4 py-2.5 text-xs font-bold text-gray-700 hover:bg-wa-teal/5 hover:text-wa-teal transition-all flex items-center justify-between group"
+                                                                                        >
+                                                                                            #{tag}
+                                                                                            <Plus size={10} className="opacity-0 group-hover:opacity-100" />
+                                                                                        </button>
+                                                                                    ))
+                                                                            ) : (
+                                                                                <p className="px-4 py-3 text-[10px] text-gray-400 italic">No tags found in AI rules.</p>
+                                                                            )}
+                                                                        </div>
+                                                                    </motion.div>
+                                                                </>
+                                                            )}
+                                                        </AnimatePresence>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            <div className="space-y-3">
+                                                <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest px-2">Privacy & Actions</h4>
+                                                <div className="space-y-2">
+                                                    <button 
+                                                        onClick={() => {
+                                                            (window as any).setActiveTab('campaign');
+                                                        }}
+                                                        className="w-full flex items-center justify-between p-4 rounded-2xl bg-white border border-gray-100 hover:border-wa-teal/30 hover:shadow-lg hover:shadow-wa-teal/5 transition-all group"
+                                                    >
+                                                        <div className="flex items-center gap-3 text-gray-700">
+                                                            <div className="p-2 bg-wa-teal/10 rounded-lg text-wa-teal">
+                                                                <BarChart3 size={18} />
+                                                            </div>
+                                                            <span className="text-sm font-bold">View Order history</span>
+                                                        </div>
+                                                        <Clock size={14} className="text-gray-300" />
+                                                    </button>
+                                                    <button className="w-full flex items-center justify-between p-4 rounded-2xl hover:bg-white transition-all group border border-transparent hover:border-white hover:shadow-sm">
+                                                        <div className="flex items-center gap-3 text-gray-700">
+                                                            <div className="p-2 bg-blue-50 rounded-lg text-blue-500">
+                                                                <Bell size={18} />
+                                                            </div>
+                                                            <span className="text-sm font-bold">Mute Notifications</span>
+                                                        </div>
+                                                        <div className="w-10 h-6 bg-gray-200 rounded-full relative p-1 transition-colors group-hover:bg-wa-teal/20">
+                                                            <div className="w-4 h-4 bg-white rounded-full shadow-md"></div>
+                                                        </div>
+                                                    </button>
+                                                </div>
+                                            </div>
+
+                                            <div className="space-y-3 pt-4 border-t border-gray-100">
+                                                <button className="w-full flex items-center gap-4 p-4 rounded-2xl text-rose-500 hover:bg-rose-50/50 transition-all font-bold group border border-transparent hover:border-rose-100">
+                                                    <div className="p-2 bg-rose-50 rounded-lg text-rose-500 group-hover:scale-110 transition-transform">
+                                                        <Ban size={18} />
+                                                    </div>
+                                                    <span>Block {activeChat?.name}</span>
+                                                </button>
+                                            </div>
+                                        </>
+                                    ) : (
+                                        <div className="text-center py-12 text-gray-400 font-bold italic">Contact intelligence not found.</div>
+                                    )}
                                 </div>
                             </div>
                         </motion.div>

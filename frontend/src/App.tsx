@@ -11,7 +11,10 @@ import {
   MessageSquare,
   FileText,
   BarChart3,
-  BrainCircuit
+  BrainCircuit,
+  Zap,
+  PackageCheck,
+  ShoppingCart
 } from 'lucide-react';
 
 import { AppTab, Contact, MessageLog, Group } from './types';
@@ -27,7 +30,14 @@ import ProcessModal from './components/ProcessModal';
 import { ModalProvider } from './components/ModalProvider';
 import SettingsView from './components/SettingsView';
 import AIBrainView from './components/AIBrainView';
+import PurchaseView from './components/PurchaseView';
+import IntelligenceHubView from './components/IntelligenceHubView';
+import AIFailoverView from './components/AIFailoverView';
+import OMSView from './components/OMSView';
+import SuppliersView from './components/SuppliersView';
+import FinanceView from './components/FinanceView';
 import FloatingActiveExecutions from './components/FloatingActiveExecutions';
+import { ShieldCheck, Truck, Wallet } from 'lucide-react';
 
 import { io, Socket } from 'socket.io-client';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -67,6 +77,25 @@ interface ProcessState {
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<AppTab>(AppTab.DASHBOARD);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [backOrderCount, setBackOrderCount] = useState(0);
+  const [preSelectedProcurement, setPreSelectedProcurement] = useState<any>(null);
+
+  const checkBackOrders = useRef(async () => {
+    try {
+      const res = await fetch('http://localhost:3001/api/ai-brain/products?limit=1000');
+      const data = await res.json();
+      if (data.success) {
+        const count = data.products.filter((p: any) => p.stock_quantity < 0).length;
+        setBackOrderCount(count);
+      }
+    } catch (e) { }
+  }).current;
+
+  useEffect(() => {
+    checkBackOrders();
+    const timer = setInterval(checkBackOrders, 30000); // Check every 30s
+    return () => clearInterval(timer);
+  }, [checkBackOrders]);
 
   const {
     contacts, setContacts,
@@ -99,11 +128,23 @@ const App: React.FC = () => {
     campaignName: ''
   });
 
-  // Expose routing setters
+  // Global procurement logging listener
   useEffect(() => {
-    (window as any).setActiveTab = setActiveTab;
-    (window as any).setSelectedChat = setSelectedChat;
-  }, [setSelectedChat]);
+    if (!socket) return;
+    socket.on('procurement_log', (msg: string) => {
+      console.log('%c' + msg, 'color: #8b5cf6; font-weight: bold; background: #f5f3ff; padding: 2px 5px; border-radius: 4px;');
+    });
+    return () => { socket.off('procurement_log'); };
+  }, [socket]);
+
+  const [incomingToast, setIncomingToast] = useState<{ name: string; number: string; text: string; time: string } | null>(null);
+
+  useEffect(() => {
+    if (incomingToast) {
+      const timer = setTimeout(() => setIncomingToast(null), 4000);
+      return () => clearTimeout(timer);
+    }
+  }, [incomingToast]);
 
   // Hook for socket event handlers
   useSocketHandlers({
@@ -114,7 +155,10 @@ const App: React.FC = () => {
     setScheduledCampaigns,
     fetchScheduled,
     setProcessState,
-    setIsConnected
+    setIsConnected,
+    onNewIncomingMessage: (msg) => {
+      setIncomingToast({ ...msg, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) });
+    }
   });
 
   const handlePauseCampaign = async (id: any) => {
@@ -219,6 +263,10 @@ const App: React.FC = () => {
 
   const handleSendMessage = (phone: string, text: string, mediaUrl?: string, mediaType?: string, quotedMessageId?: string, quotedText?: string, attachments?: any[], templateId?: string | number) => {
     if (socket) {
+      if (!phone || phone.length < 5 || phone === '@c.us') {
+        console.warn('[App] Blocked send attempt to invalid phone number:', phone);
+        return;
+      }
       socket.emit('send-message', {
         to: phone,
         text: text,
@@ -270,6 +318,8 @@ const App: React.FC = () => {
                     setContacts={setContacts}
                     groups={groups}
                     setGroups={setGroups}
+                    setActiveTab={setActiveTab}
+                    setSelectedChat={setSelectedChat}
                   />;
                 case AppTab.CAMPAIGN:
                   return (
@@ -307,7 +357,25 @@ const App: React.FC = () => {
                 case AppTab.SETTINGS:
                   return <SettingsView />;
                 case AppTab.AIBRAIN:
-                  return <AIBrainView />;
+                  return <AIBrainView onProcurementRequest={(p) => {
+                    setPreSelectedProcurement(p);
+                    setActiveTab(AppTab.PURCHASES);
+                  }} />;
+                case AppTab.PURCHASES:
+                  return <PurchaseView 
+                    preSelected={preSelectedProcurement} 
+                    clearPreSelected={() => setPreSelectedProcurement(null)} 
+                  />;
+                case AppTab.INTELLIGENCE:
+                  return <IntelligenceHubView />;
+                case AppTab.AI_FAILOVER:
+                  return <AIFailoverView />;
+                case AppTab.OMS:
+                  return <OMSView />;
+                case AppTab.SUPPLIERS:
+                  return <SuppliersView />;
+                case AppTab.FINANCE:
+                  return <FinanceView />;
                 default:
                   return <DashboardView contacts={contacts} logs={messageLogs} isConnected={isConnected} />;
               }
@@ -369,6 +437,14 @@ const App: React.FC = () => {
               onClick={() => setActiveTab(AppTab.DASHBOARD)}
             />
             <SidebarItem
+              icon={<PackageCheck size={20} />}
+              label="OMS (Orders)"
+              active={activeTab === AppTab.OMS}
+              isOpen={isSidebarOpen}
+              onClick={() => setActiveTab(AppTab.OMS)}
+              alert={backOrderCount > 0 ? backOrderCount : undefined}
+            />
+            <SidebarItem
               icon={<QrCode size={20} />}
               label="Connect"
               active={activeTab === AppTab.CONNECT}
@@ -423,6 +499,41 @@ const App: React.FC = () => {
               active={activeTab === AppTab.AIBRAIN}
               isOpen={isSidebarOpen}
               onClick={() => setActiveTab(AppTab.AIBRAIN)}
+            />
+            <SidebarItem
+              icon={<Zap size={20} />}
+              label="Intelligence"
+              active={activeTab === AppTab.INTELLIGENCE}
+              isOpen={isSidebarOpen}
+              onClick={() => setActiveTab(AppTab.INTELLIGENCE)}
+            />
+            <SidebarItem
+              icon={<ShieldCheck size={20} />}
+              label="AI Failover"
+              active={activeTab === AppTab.AI_FAILOVER}
+              isOpen={isSidebarOpen}
+              onClick={() => setActiveTab(AppTab.AI_FAILOVER)}
+            />
+            <SidebarItem
+              icon={<ShoppingCart size={20} />}
+              label="Purchases"
+              active={activeTab === AppTab.PURCHASES}
+              isOpen={isSidebarOpen}
+              onClick={() => setActiveTab(AppTab.PURCHASES)}
+            />
+            <SidebarItem
+              icon={<Truck size={20} />}
+              label="Suppliers"
+              active={activeTab === AppTab.SUPPLIERS}
+              isOpen={isSidebarOpen}
+              onClick={() => setActiveTab(AppTab.SUPPLIERS)}
+            />
+            <SidebarItem
+              icon={<Wallet size={20} />}
+              label="Finance"
+              active={activeTab === AppTab.FINANCE}
+              isOpen={isSidebarOpen}
+              onClick={() => setActiveTab(AppTab.FINANCE)}
             />
             <SidebarItem
               icon={<Settings size={20} />}
@@ -481,6 +592,28 @@ const App: React.FC = () => {
         onClose={() => setResumeModal({ ...resumeModal, isOpen: false })}
         onConfirm={(mins) => handleResumeCampaign(resumeModal.campaignId!, mins)}
       />
+      <AnimatePresence>
+        {incomingToast && (
+          <motion.div
+            initial={{ opacity: 0, y: -20, scale: 0.9 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.9 }}
+            className="fixed top-6 right-6 z-50 bg-gray-900/90 text-white backdrop-blur-xl border border-emerald-500/30 p-4 rounded-2xl shadow-2xl flex items-center gap-4 max-w-sm"
+          >
+            <div className="w-10 h-10 bg-emerald-500/20 text-emerald-400 rounded-xl flex items-center justify-center font-bold text-lg">
+              💬
+            </div>
+            <div className="flex-1 overflow-hidden">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-black text-emerald-400 truncate">{incomingToast.name}</p>
+                <span className="text-[10px] text-gray-400 ml-2">{incomingToast.time}</span>
+              </div>
+              <p className="text-xs text-gray-200 truncate mt-0.5">{incomingToast.text}</p>
+            </div>
+            <button onClick={() => setIncomingToast(null)} className="text-gray-400 hover:text-white font-bold text-xs p-1 cursor-pointer">✕</button>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </ModalProvider>
   );
 };
@@ -491,16 +624,22 @@ interface SidebarItemProps {
   active: boolean;
   isOpen: boolean;
   onClick: () => void;
+  alert?: number | string;
 }
 
-const SidebarItem: React.FC<SidebarItemProps> = ({ icon, label, active, isOpen, onClick }) => (
+const SidebarItem: React.FC<SidebarItemProps> = ({ icon, label, active, isOpen, onClick, alert }) => (
   <button
     onClick={onClick}
-    className={`w-full flex items-center gap-4 px-6 py-4 transition-colors ${active ? 'bg-wa-hover text-wa-teal border-r-4 border-wa-teal' : 'text-gray-400 hover:bg-wa-card hover:text-white'
+    className={`w-full flex items-center gap-4 px-6 py-4 transition-all relative ${active ? 'bg-wa-hover text-wa-teal border-r-4 border-wa-teal' : 'text-gray-400 hover:bg-wa-card hover:text-white'
       }`}
   >
-    {icon}
+    <div className="flex-shrink-0">{icon}</div>
     {isOpen && <span className="font-medium">{label}</span>}
+    {alert && (
+      <div className={`absolute ${isOpen ? 'right-4' : 'right-4 top-2'} flex items-center justify-center min-w-[20px] h-[20px] bg-rose-500 text-white text-[10px] font-black rounded-full px-1 shadow-sm border-2 border-wa-sidebar animate-pulse z-10`}>
+        {alert}
+      </div>
+    )}
   </button>
 );
 

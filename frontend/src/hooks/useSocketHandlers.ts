@@ -11,6 +11,7 @@ interface SocketHandlersProps {
     setProcessState: (updater: (prev: any) => any) => void;
     setIsConnected: (connected: boolean) => void;
     fetchScheduled: () => Promise<void>;
+    onNewIncomingMessage?: (msg: { name: string; number: string; text: string }) => void;
 }
 
 export const useSocketHandlers = ({
@@ -21,7 +22,8 @@ export const useSocketHandlers = ({
     setScheduledCampaigns,
     setProcessState,
     setIsConnected,
-    fetchScheduled
+    fetchScheduled,
+    onNewIncomingMessage
 }: SocketHandlersProps) => {
     useEffect(() => {
         if (socket) {
@@ -48,11 +50,21 @@ export const useSocketHandlers = ({
             socket.on('message-sent', (data: any) => {
                 setMessageLogs(prev => {
                     const wId = data.whatsappId || data.whatsapp_id;
-                    if (wId && prev.some(log => log.whatsappId === wId)) {
-                        return prev;
-                    }
+                    const idStr = data.id ? data.id.toString() : null;
+                    const phone = data.to;
+                    const content = data.text;
+                    const ts = new Date(data.timestamp || Date.now()).getTime();
+
+                    const isDuplicate = prev.some(log => {
+                        if (idStr && log.id.toString() === idStr) return true;
+                        if (wId && log.whatsappId && log.whatsappId === wId) return true;
+                        if (log.phone === phone && log.content === content && Math.abs(new Date(log.timestamp).getTime() - ts) < 3000) return true;
+                        return false;
+                    });
+                    if (isDuplicate) return prev;
+
                     const newLog: MessageLog = {
-                        id: data.id || Date.now().toString(),
+                        id: idStr || Date.now().toString(),
                         whatsappId: wId,
                         contactId: data.contactId || 'unknown',
                         contactName: data.contactName || data.to,
@@ -91,11 +103,21 @@ export const useSocketHandlers = ({
             socket.on('new_message', (data: any) => {
                 setMessageLogs(prev => {
                     const wId = data.whatsappId || data.whatsapp_id;
-                    if (wId && prev.some(log => log.whatsappId === wId)) {
-                        return prev;
-                    }
+                    const idStr = data.id ? data.id.toString() : null;
+                    const phone = data.number;
+                    const content = data.text;
+                    const ts = new Date(data.timestamp || Date.now()).getTime();
+
+                    const isDuplicate = prev.some(log => {
+                        if (idStr && log.id.toString() === idStr) return true;
+                        if (wId && log.whatsappId && log.whatsappId === wId) return true;
+                        if (log.phone === phone && log.content === content && Math.abs(new Date(log.timestamp).getTime() - ts) < 3000) return true;
+                        return false;
+                    });
+                    if (isDuplicate) return prev;
+
                     const newLog: MessageLog = {
-                        id: data.id || Date.now().toString(),
+                        id: idStr || Date.now().toString(),
                         whatsappId: wId,
                         contactId: '0',
                         contactName: data.contactName || data.number,
@@ -109,6 +131,13 @@ export const useSocketHandlers = ({
                         quotedMsg: data.quotedMsg,
                         metadata: data.metadata
                     };
+                    if (data.type !== 'sent' && onNewIncomingMessage) {
+                        onNewIncomingMessage({
+                            name: data.contactName || data.number,
+                            number: data.number,
+                            text: data.text || 'New message received'
+                        });
+                    }
                     return [newLog, ...prev];
                 });
             });
@@ -141,7 +170,7 @@ export const useSocketHandlers = ({
                         metadata: m.metadata
                     }));
 
-                    const filteredNew = newMessages.filter(nm => !prev.some(p => p.whatsappId === nm.whatsappId));
+                    const filteredNew = newMessages.filter(nm => !prev.some(p => p.id === nm.id || (p.whatsappId && p.whatsappId === nm.whatsappId) || (p.phone === nm.phone && p.content === nm.content && Math.abs(new Date(p.timestamp).getTime() - new Date(nm.timestamp).getTime()) < 3000)));
                     return [...prev, ...filteredNew].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
                 });
             });

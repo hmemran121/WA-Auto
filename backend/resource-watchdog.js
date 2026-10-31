@@ -8,11 +8,21 @@ const CHECK_INTERVAL_MS = 60000; // 1 minute
 console.log('🚀 [Resource-Watchdog] Active. Monitoring system pulse...');
 
 const cleanupZombies = () => {
-    console.log('🧹 [Watchdog] Hunting for zombie browser processes...');
+    console.log('🧹 [Watchdog] Checking browser process state...');
     if (process.platform === 'win32') {
         try {
-            // Kill any chrome/chromium that doesn't belong to an active session
-            // or is orphaned (no parent or parent is gone)
+            const sessionPath = path.join(__dirname, '.wwebjs_auth', 'session-wa-auto-client');
+            const devtoolsPortFile = path.join(sessionPath, 'DevToolsActivePort');
+            
+            // If active lock exists and modified recently (< 2 minutes), do NOT kill browser
+            if (fs.existsSync(devtoolsPortFile)) {
+                const stats = fs.statSync(devtoolsPortFile);
+                if (Date.now() - stats.mtimeMs < 120000) {
+                    console.log('ℹ️ [Watchdog] Active WhatsApp Web session active. Skipping zombie cleanup.');
+                    return;
+                }
+            }
+
             execSync('powershell -Command "Get-CimInstance Win32_Process -Filter \\"Name LIKE \'%chrome%\' OR Name LIKE \'%chromium%\'\\" | Where-Object { $_.CommandLine -like \'*session-wa-auto-client*\' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"');
         } catch (e) {}
     }
@@ -21,7 +31,15 @@ const cleanupZombies = () => {
 const clearFileLocks = () => {
     const sessionPath = path.join(__dirname, '.wwebjs_auth', 'session-wa-auto-client');
     if (fs.existsSync(sessionPath)) {
-        const locks = ['SingletonLock', 'DevToolsActivePort'];
+        const devtoolsPortFile = path.join(sessionPath, 'DevToolsActivePort');
+        if (fs.existsSync(devtoolsPortFile)) {
+            const stats = fs.statSync(devtoolsPortFile);
+            if (Date.now() - stats.mtimeMs < 120000) {
+                console.log('ℹ️ [Watchdog] Active session detected. Skipping lock removal.');
+                return;
+            }
+        }
+        const locks = ['SingletonLock'];
         locks.forEach(lock => {
             const lockPath = path.join(sessionPath, lock);
             if (fs.existsSync(lockPath)) {

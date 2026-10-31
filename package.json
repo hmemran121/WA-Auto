@@ -5,7 +5,7 @@
     "scripts": {
         "postinstall": "npm run install-all",
         "install-all": "cd backend && npm install && cd ../frontend && npm install",
-        "dev": "npx -y kill-port 3001 && concurrently \"npm run backend\" \"npm run frontend\"",
+        "dev": "npx -y kill-port 3000 3001 && concurrently \"npm run backend\" \"npm run frontend\"",
         "backend": "cd backend && concurrently \"npm run dev\" \"npm run service\" \"npm run watchdog\"",
         "frontend": "cd frontend && npm run dev",
         "watchdog": "node backend/resource-watchdog.js",

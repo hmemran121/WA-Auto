@@ -100,6 +100,7 @@ const SettingsView: React.FC = () => {
     const [enableDailyLimit, setEnableDailyLimit] = useState(true);
     const [enableBatching, setEnableBatching] = useState(true);
     const [enableWindows, setEnableWindows] = useState(true);
+    const [aiTaggingRules, setAiTaggingRules] = useState('');
 
     const [isLoading, setIsLoading] = useState(true);
     const [isSaving, setIsSaving] = useState(false);
@@ -140,6 +141,7 @@ const SettingsView: React.FC = () => {
                 setEnableDailyLimit(s.enable_daily_limit !== 'false');
                 setEnableBatching(s.enable_batching !== 'false');
                 setEnableWindows(s.enable_windows !== 'false');
+                if (s.ai_tagging_rules) setAiTaggingRules(s.ai_tagging_rules);
             }
         } catch (e) {
             console.error('Failed to fetch settings:', e);
@@ -164,7 +166,8 @@ const SettingsView: React.FC = () => {
                 enable_jitter: String(enableJitter),
                 enable_daily_limit: String(enableDailyLimit),
                 enable_batching: String(enableBatching),
-                enable_windows: String(enableWindows)
+                enable_windows: String(enableWindows),
+                ai_tagging_rules: aiTaggingRules
             };
 
             const res = await fetch('http://localhost:3001/api/settings', {
@@ -532,6 +535,61 @@ const SettingsView: React.FC = () => {
                             </div>
                         </div>
                     )}
+                </section>
+
+                {/* 5. AI Intelligence & Dynamic Tagging */}
+                <section className="bg-white p-10 rounded-[3rem] border-2 border-gray-100 shadow-sm md:col-span-2 overflow-hidden relative group">
+                    <div className="absolute top-0 right-0 p-8 text-wa-teal/5 -rotate-12 transition-transform group-hover:rotate-0 duration-500">
+                        <Zap size={120} />
+                    </div>
+                    <div className="flex items-center gap-6 mb-8">
+                        <div className="p-5 bg-wa-teal/10 text-wa-teal rounded-[2rem] shadow-inner">
+                            <Zap size={32} />
+                        </div>
+                        <div>
+                            <h2 className="font-black text-gray-900 text-2xl uppercase tracking-tighter">AI Intelligence & Tagging</h2>
+                            <p className="text-xs text-gray-400 font-bold tracking-[0.3em] uppercase">Dynamic Segmentation Rules</p>
+                        </div>
+                    </div>
+
+                    <div className="space-y-6 relative z-10">
+                        <div className="p-6 bg-slate-50 rounded-[2.5rem] border border-slate-100 flex items-start gap-4">
+                            <AlertCircle className="text-wa-teal shrink-0 mt-1" size={20} />
+                            <div className="space-y-1">
+                                <p className="text-sm font-black text-slate-800 uppercase tracking-tight">How it works</p>
+                                <p className="text-xs text-slate-500 font-bold leading-relaxed">
+                                    নিচে আপনার এআই-এর জন্য ট্যাগিং গাইডলাইন লিখে দিন। কথোপকথনের সময় এআই এই রুলগুলো অনুসরণ করে কাস্টমারদের অটোমেটিক ট্যাগ করবে। উদাহরণস্বরূপ: "কাস্টমার যদি ডিসকাউন্ট চায় তবে তাকে #PriceSensitive ট্যাগ দিন।"
+                                </p>
+                            </div>
+                        </div>
+
+                        <div className="space-y-3">
+                            <label className="text-[10px] font-black text-gray-400 uppercase tracking-widest pl-2">AI Tagging Instructions</label>
+                            <textarea
+                                value={aiTaggingRules}
+                                onChange={(e) => setAiTaggingRules(e.target.value)}
+                                placeholder="e.g. 1. If customer asks for discount, assign #Price_Sensitive&#10;2. If customer is repeat buyer, assign #Loyal"
+                                className="w-full h-48 bg-gray-50 border-2 border-transparent focus:border-wa-teal focus:bg-white rounded-[2.5rem] p-8 outline-none transition-all font-bold text-gray-700 text-sm leading-relaxed shadow-inner resize-none"
+                            />
+                        </div>
+
+                        <div className="flex items-center justify-between gap-3 p-4 bg-emerald-50 rounded-2xl border border-emerald-100">
+                            <div className="flex items-center gap-3">
+                                <ShieldCheck className="text-emerald-500" size={18} />
+                                <p className="text-[10px] text-emerald-700 font-black uppercase tracking-widest">
+                                    Rules are injected directly into the Gemini-2.5-Flash Knowledge Engine.
+                                </p>
+                            </div>
+                            <button
+                                onClick={handleSave}
+                                disabled={isSaving}
+                                className="bg-wa-teal text-white px-4 py-2 rounded-xl font-black text-[10px] uppercase tracking-widest shadow-md hover:bg-wa-teal/90 disabled:opacity-50 flex items-center gap-2"
+                            >
+                                {isSaving ? <Loader2 className="animate-spin" size={12} /> : <Save size={12} />}
+                                Update Rules
+                            </button>
+                        </div>
+                    </div>
                 </section>
             </div>
 

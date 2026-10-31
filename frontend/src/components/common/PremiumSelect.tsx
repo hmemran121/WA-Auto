@@ -34,7 +34,30 @@ const PremiumSelect: React.FC<PremiumSelectProps> = ({
 }) => {
     const [isOpen, setIsOpen] = useState(false);
     const [searchTerm, setSearchTerm] = useState("");
+    const [dynamicMaxHeight, setDynamicMaxHeight] = useState('300px');
     const dropdownRef = useRef<HTMLDivElement>(null);
+    const listContainerRef = useRef<HTMLDivElement>(null);
+
+    const calculateSpace = () => {
+        if (dropdownRef.current) {
+            const rect = dropdownRef.current.getBoundingClientRect();
+            const spaceBelow = window.innerHeight - rect.bottom - 40; // 40px safety margin
+            // Minimum 200px, otherwise use available space
+            setDynamicMaxHeight(`${Math.max(200, spaceBelow)}px`);
+        }
+    };
+
+    useEffect(() => {
+        if (isOpen) {
+            calculateSpace();
+            window.addEventListener('resize', calculateSpace);
+            window.addEventListener('scroll', calculateSpace, true);
+        }
+        return () => {
+            window.removeEventListener('resize', calculateSpace);
+            window.removeEventListener('scroll', calculateSpace, true);
+        };
+    }, [isOpen]);
 
     const selectedOption = options.find(opt => opt.value === value);
 
@@ -158,7 +181,11 @@ const PremiumSelect: React.FC<PremiumSelectProps> = ({
                             </div>
                         )}
 
-                        <div className="max-h-64 overflow-y-auto custom-scrollbar space-y-1">
+                        <div 
+                            ref={listContainerRef}
+                            className="overflow-y-auto custom-scrollbar space-y-1"
+                            style={{ maxHeight: dynamicMaxHeight }}
+                        >
                             {filteredOptions.length > 0 ? (
                                 filteredOptions.map(option => (
                                     <button

@@ -5,8 +5,9 @@ frontend/node_modules/
 
 # WhatsApp Session/Cache
 .wwebjs_auth/
+.wwebjs_auth*/
 .wwebjs_cache/
-
+**/.wwebjs_auth*/
 
 # Build and Temporary
 frontend/dist/
@@ -14,18 +15,27 @@ backend/uploads/
 *.log
 .env
 .env.local
+.env.*
+!.env.example
 .DS_Store
+tmp/
+brain/
+scratch/
+**/scratch/
 
 # Databases
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
 
 # Reports and Diagnostics
 backend/crawl_health_report.md
-backend/turaag_page.html
+backend/*.html
 backend/live_out.txt
 backend/price_verification_result.txt
 backend/debug.log
 backend/price_log.txt
+
 

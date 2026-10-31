@@ -33,6 +33,9 @@ export interface Contact {
   city?: string;
   companyName?: string;
   lastPurchase?: string;
+  interest_score?: number;
+  price_sensitivity_score?: number;
+  loyalty_score?: number;
 }
 
 export interface MessageLog {
@@ -64,7 +67,13 @@ export enum AppTab {
   TEMPLATES = 'templates',
   ANALYTICS = 'analytics',
   SETTINGS = 'settings',
-  AIBRAIN = 'aibrain'
+  AIBRAIN = 'aibrain',
+  INTELLIGENCE = 'intelligence',
+  AI_FAILOVER = 'ai-failover',
+  OMS = 'oms',
+  PURCHASES = 'purchases',
+  SUPPLIERS = 'suppliers',
+  FINANCE = 'finance'
 }
 
 

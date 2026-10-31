@@ -1,12 +1,17 @@
 {
     "ignore": [
-        "data.db",
-        "data.db-journal",
-        "data.db-wal",
-        "data.db-shm",
-        "uploads/*",
-        "*.log"
+        ".wwebjs_auth/**",
+        ".wwebjs_cache/**",
+        "*.db",
+        "*.db-journal",
+        "*.db-wal",
+        "*.db-shm",
+        "uploads/**",
+        "scratch/**",
+        "tmp/**",
+        "*.log",
+        "debug.log"
     ],
     "ext": "js,jsx,json,ts,tsx",
-    "delay": "1000"
+    "delay": "2000"
 }

@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Search, Trash2, Edit2, X, UserPlus, Users, Phone, ShieldCheck, MoreVertical, Upload, FileText, CheckCircle2, ChevronRight, Filter, Zap, GripVertical, UserMinus, AlertTriangle, LogOut } from 'lucide-react';
-import { Contact, Group } from '../types';
+import { Plus, Search, Trash2, Edit2, X, UserPlus, Users, Phone, ShieldCheck, MoreVertical, Upload, FileText, CheckCircle2, ChevronRight, Filter, Zap, GripVertical, UserMinus, AlertTriangle, LogOut, MessageSquare } from 'lucide-react';
+import { Contact, Group, AppTab } from '../types';
 import { motion, AnimatePresence } from 'framer-motion';
+import FinancialLedger, { FinancialEvent } from './finance/FinancialLedger';
+import FinancialSnapshot, { FinancialDNA } from './finance/FinancialSnapshot';
 import * as XLSX from 'xlsx';
 
 interface ContactsViewProps {
@@ -9,6 +11,8 @@ interface ContactsViewProps {
   setContacts: React.Dispatch<React.SetStateAction<Contact[]>>;
   groups: Group[];
   setGroups: React.Dispatch<React.SetStateAction<Group[]>>;
+  setActiveTab?: (tab: AppTab) => void;
+  setSelectedChat?: (chat: string | null) => void;
 }
 
 const containerVariants = {
@@ -30,7 +34,7 @@ const itemVariants = {
 
 
 
-const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, groups, setGroups }) => {
+const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, groups, setGroups, setActiveTab, setSelectedChat }) => {
   // Main Utility State
   const [searchTerm, setSearchTerm] = useState('');
   const [showModal, setShowModal] = useState(false);
@@ -108,6 +112,7 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
   const [activeProfileId, setActiveProfileId] = useState<string | null>(null);
   const [profileData, setProfileData] = useState<any>(null);
   const [isProfileLoading, setIsProfileLoading] = useState(false);
+  const [activeProfileTab, setActiveProfileTab] = useState<'overview' | 'finance' | 'messages'>('overview');
 
   // Inline Editing State
   const [editingContactId, setEditingContactId] = useState<string | null>(null);
@@ -156,15 +161,20 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
     setEditingContactId(null);
   };
 
-  const fetchContactProfile = async (id: string) => {
-    setActiveProfileId(id);
+  const fetchContactProfile = async (contactId: string) => {
     setIsProfileLoading(true);
+    setActiveProfileTab('overview');
     try {
-      const response = await fetch(`http://localhost:3001/api/contacts/${id}/history`);
-      const data = await response.json();
-      setProfileData(data);
+      const contact = contacts.find(c => c.id === contactId);
+      const identifier = contact ? contact.phone : contactId;
+      const res = await fetch(`http://localhost:3001/api/contacts/profile/${identifier}`);
+      const data = await res.json();
+      if (data.success) {
+        setProfileData(data);
+        setActiveProfileId(contactId);
+      }
     } catch (err) {
-      console.error('Failed to fetch profile history:', err);
+      console.error('Failed to fetch contact profile', err);
     } finally {
       setIsProfileLoading(false);
     }
@@ -188,18 +198,20 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
         name: c.name,
         phone: c.number,
         status: 'active',
-        groupNames: c.groupNames || [],
+        groupNames: c.groupNames || '',
         tags: (() => {
           if (!c.tags) return [];
           try { return JSON.parse(c.tags); }
           catch { return typeof c.tags === 'string' ? c.tags.split(',').map((t: string) => t.trim()) : []; }
         })(),
         engagementScore: c.engagement_score || 0,
-        email: c.email,
-        address: c.address,
         city: c.city,
         companyName: c.company_name,
-        lastPurchase: c.last_purchase
+        lastPurchase: c.last_purchase,
+        lifecycleStage: c.lifecycle_stage,
+        lifetimeValue: c.lifetime_value,
+        sentimentScore: c.sentiment_score,
+        funnelNotes: c.funnel_notes
       })));
     } catch (err) {
       console.error('Failed to fetch all contacts:', err);
@@ -218,18 +230,20 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
         name: c.name,
         phone: c.number,
         status: 'active',
-        groupNames: c.groupNames || [],
+        groupNames: c.groupNames || '',
         tags: (() => {
           if (!c.tags) return [];
           try { return JSON.parse(c.tags); }
           catch { return typeof c.tags === 'string' ? c.tags.split(',').map((t: string) => t.trim()) : []; }
         })(),
         engagementScore: c.engagement_score || 0,
-        email: c.email,
-        address: c.address,
         city: c.city,
         companyName: c.company_name,
-        lastPurchase: c.last_purchase
+        lastPurchase: c.last_purchase,
+        lifecycleStage: c.lifecycle_stage,
+        lifetimeValue: c.lifetime_value,
+        sentimentScore: c.sentiment_score,
+        funnelNotes: c.funnel_notes
       }));
       setContacts(mapped);
       // If we are showing all contacts, also update allContacts state
@@ -991,7 +1005,7 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
                           )}
                         </div>
                       </th>
-                      <th
+                       <th
                         className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-[0.2em] cursor-pointer hover:text-wa-teal transition-colors"
                         onClick={() => toggleSort('phone')}
                       >
@@ -1002,6 +1016,8 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
                           )}
                         </div>
                       </th>
+                      <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-[0.2em]">Funnel Stage</th>
+                      <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-[0.2em]">LTV / Revenue</th>
                       <th className="px-6 py-4 text-[10px] font-black text-gray-400 uppercase tracking-[0.2em]">Status</th>
                     </tr>
                   </thead>
@@ -1087,7 +1103,7 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
                                       </p>
                                     )}
                                     <div className="flex flex-wrap gap-1 mt-1">
-                                      {contact.groupNames ? contact.groupNames.split(',').map((gn, idx) => (
+                                      {String(contact.groupNames || '').split(',').filter(Boolean).length > 0 ? String(contact.groupNames).split(',').map((gn, idx) => (
                                         <span key={idx} className="text-[8px] font-black bg-indigo-50/50 text-indigo-500 px-1.5 py-0.5 rounded-md uppercase tracking-tighter border border-indigo-100/30">
                                           {gn}
                                         </span>
@@ -1124,12 +1140,25 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
                                   )}
                                 </div>
                               </td>
-                              <td className="px-6 py-4" onClick={() => fetchContactProfile(contact.id)} onContextMenu={(e) => {
-                                e.preventDefault();
-                                setContextMenu({ x: e.clientX, y: e.clientY, contactId: contact.id });
-                              }}>
-                                <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest bg-emerald-100/50 text-wa-teal border border-emerald-200/50">
-                                  <ShieldCheck size={10} /> Active
+                              <td className="px-6 py-4">
+                                <span className={`inline-flex items-center px-2.5 py-1 rounded-lg text-[9px] font-black uppercase tracking-widest ${
+                                  contact.lifecycleStage === 'customer' ? 'bg-emerald-50 text-emerald-600 border border-emerald-100' :
+                                  contact.lifecycleStage === 'prospect' ? 'bg-blue-50 text-blue-600 border border-blue-100' :
+                                  contact.lifecycleStage === 'vip' ? 'bg-purple-600 text-white border border-purple-700 shadow-sm' :
+                                  'bg-gray-50 text-gray-400 border border-gray-100'
+                                }`}>
+                                  {contact.lifecycleStage || 'Lead'}
+                                </span>
+                              </td>
+                              <td className="px-6 py-4">
+                                <div className="flex flex-col">
+                                  <span className="text-sm font-black text-gray-900 leading-none">৳{contact.lifetimeValue || 0}</span>
+                                  <span className="text-[9px] font-bold text-gray-400 uppercase tracking-widest mt-1">LTV</span>
+                                </div>
+                              </td>
+                              <td className="px-6 py-4">
+                                <span className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-[8px] font-black uppercase tracking-widest ${contact.status === 'active' ? 'bg-emerald-100/50 text-wa-teal border border-emerald-200/50' : 'bg-gray-100 text-gray-400'}`}>
+                                  <ShieldCheck size={10} /> {contact.status}
                                 </span>
                               </td>
                             </tr>
@@ -1330,9 +1359,9 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
                             <div>
                               <p className="font-bold text-gray-800 text-sm">{contact.name}</p>
                               <p className="text-[10px] text-gray-400 font-bold">{contact.phone}</p>
-                              {contact.groupNames && (
+                              {String(contact.groupNames || '').split(',').filter(Boolean).length > 0 && (
                                 <p className="text-[8px] text-indigo-400/60 font-medium uppercase tracking-tighter mt-0.5 leading-none">
-                                  Existing: {contact.groupNames.split(',').join(' • ')}
+                                  Existing: {String(contact.groupNames).split(',').join(' • ')}
                                 </p>
                               )}
                             </div>
@@ -1722,7 +1751,7 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
               animate={{ x: 0 }}
               exit={{ x: '100%' }}
               transition={{ type: 'spring', damping: 25, stiffness: 200 }}
-              className="fixed top-0 right-0 h-full w-full max-w-md bg-white shadow-2xl z-[130] flex flex-col border-l border-white overflow-hidden"
+              className="fixed top-0 right-0 h-full w-full max-w-3xl bg-white shadow-2xl z-[130] flex flex-col border-l border-white overflow-hidden"
             >
               {isProfileLoading ? (
                 <div className="flex-1 flex flex-col items-center justify-center text-wa-teal">
@@ -1753,7 +1782,7 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
 
                         <div className="flex flex-col items-center justify-center gap-2 mt-4">
                           <div className="flex flex-wrap items-center justify-center gap-2">
-                            {profileData.contact.groupNames ? profileData.contact.groupNames.split(',').map((gn: string, idx: number) => (
+                            {String(profileData.contact.groupNames || '').split(',').filter(Boolean).length > 0 ? String(profileData.contact.groupNames).split(',').map((gn: string, idx: number) => (
                               <span key={idx} className="bg-indigo-50 text-indigo-600 px-3 py-1 rounded-lg text-[10px] font-black uppercase tracking-widest border border-indigo-100 shadow-sm">
                                 <Users size={10} className="inline mr-1 mb-0.5" /> {gn}
                               </span>
@@ -1835,56 +1864,145 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
                             </div>
                           )}
                         </div>
-
-                        <div className="grid grid-cols-2 gap-4 w-full mt-8 px-2 text-left">
-                          <div className="bg-white p-4 rounded-2xl border border-emerald-100 shadow-sm transition-all hover:bg-emerald-50/30">
-                            <p className="text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">City</p>
-                            <p className="text-sm font-bold text-gray-700">{profileData.contact.city || 'Not Set'}</p>
-                          </div>
-                          <div className="bg-white p-4 rounded-2xl border border-emerald-100 shadow-sm transition-all hover:bg-emerald-50/30">
-                            <p className="text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Company</p>
-                            <p className="text-sm font-bold text-gray-700">{profileData.contact.companyName || profileData.contact.company_name || 'Not Set'}</p>
-                          </div>
-                          <div className="bg-white p-4 rounded-2xl border border-emerald-100 shadow-sm transition-all hover:bg-emerald-50/30 col-span-2">
-                            <p className="text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Email</p>
-                            <p className="text-sm font-bold text-gray-700 truncate">{profileData.contact.email || 'Not Set'}</p>
-                          </div>
-                          <div className="bg-white p-4 rounded-2xl border border-emerald-100 shadow-sm transition-all hover:bg-emerald-50/30 col-span-2">
-                            <p className="text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Address</p>
-                            <p className="text-sm font-bold text-gray-700">{profileData.contact.address || 'Not Set'}</p>
-                          </div>
-                        </div>
                       </div>
+
+                    <div className="flex px-8 py-4 bg-white border-b border-gray-100 sticky top-0 z-20">
+                      {(['overview', 'finance', 'messages'] as const).map(tab => (
+                        <button
+                          key={tab}
+                          onClick={() => setActiveProfileTab(tab)}
+                          className={`flex-1 py-2 text-[10px] font-black uppercase tracking-widest transition-all relative ${activeProfileTab === tab ? 'text-wa-teal' : 'text-gray-400 hover:text-gray-600'}`}
+                        >
+                          {tab}
+                          {activeProfileTab === tab && (
+                            <motion.div layoutId="profileTab" className="absolute bottom-0 left-0 right-0 h-1 bg-wa-teal rounded-full" />
+                          )}
+                        </button>
+                      ))}
                     </div>
 
-                    <div className="flex-1 bg-gray-50 p-6">
-                      <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-6 flex items-center gap-2">
-                        <FileText size={14} /> Recent Interaction History
-                      </h4>
-
-                      <div className="space-y-4">
-                        {profileData.history && profileData.history.length > 0 ? (
-                          profileData.history.map((msg: any) => (
-                            <div key={msg.id} className={`p-4 rounded-2xl relative ${msg.type === 'sent' ? 'bg-wa-teal/10 ml-8 rounded-tr-none border border-wa-teal/20' : 'bg-white mr-8 rounded-tl-none border border-gray-200 shadow-sm'}`}>
-                              <div className="flex justify-between items-start mb-2">
-                                <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">
-                                  {new Date(msg.timestamp).toLocaleDateString()}
-                                </span>
-                                {msg.type === 'sent' && (
-                                  <span className={`text-[10px] font-black uppercase ${msg.status === 'read' ? 'text-blue-500' : 'text-gray-400'}`}>
-                                    {msg.status}
-                                  </span>
-                                )}
+                    <div className="flex-1 bg-gray-50/50 p-8">
+                      <AnimatePresence mode="wait">
+                        {activeProfileTab === 'overview' && (
+                          <motion.div
+                            key="overview"
+                            initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }}
+                            className="space-y-6"
+                          >
+                            {/* DNA Snapshot in Overview too */}
+                            {profileData.financialDNA && (
+                              <div className="transform scale-95 origin-top">
+                                <FinancialSnapshot dna={profileData.financialDNA} />
                               </div>
-                              <p className="text-sm font-medium text-gray-700 break-words">{msg.text || (msg.media_path ? '[Media]' : '[Empty]')}</p>
+                            )}
+
+                            <div className="grid grid-cols-2 gap-4">
+                              <div className="bg-white p-5 rounded-[2rem] border border-emerald-100/50 shadow-sm transition-all hover:bg-emerald-50/30">
+                                <p className="text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">City</p>
+                                <p className="text-sm font-bold text-gray-700">{profileData.contact.city || 'Not Set'}</p>
+                              </div>
+                              <div className="bg-white p-5 rounded-[2rem] border border-emerald-100/50 shadow-sm transition-all hover:bg-emerald-50/30">
+                                <p className="text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Company</p>
+                                <p className="text-sm font-bold text-gray-700">{profileData.contact.companyName || profileData.contact.company_name || 'Not Set'}</p>
+                              </div>
+                              <div className="bg-white p-5 rounded-[2rem] border border-emerald-100/50 shadow-sm transition-all hover:bg-emerald-50/30 col-span-2">
+                                <p className="text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Email</p>
+                                <p className="text-sm font-bold text-gray-700 truncate">{profileData.contact.email || 'Not Set'}</p>
+                              </div>
+                              <div className="bg-white p-5 rounded-[2rem] border border-emerald-100/50 shadow-sm transition-all hover:bg-emerald-50/30 col-span-2">
+                                <p className="text-[8px] font-black text-gray-400 uppercase tracking-widest mb-1">Address</p>
+                                <p className="text-sm font-bold text-gray-700">{profileData.contact.address || 'Not Set'}</p>
+                              </div>
                             </div>
-                          ))
-                        ) : (
-                          <div className="text-center p-8 bg-white rounded-3xl border border-dashed border-gray-200">
-                            <p className="text-sm font-bold text-gray-400">No message history found.</p>
-                          </div>
+                            
+                            {/* Behavioral Pulse (Engagement Star) */}
+                            {profileData.contact.engagement_score !== undefined && (
+                              <div className="bg-white p-6 rounded-[2rem] border border-amber-100/50 flex items-center justify-between shadow-sm">
+                                <div className="flex items-center gap-3">
+                                  <div className="p-3 bg-amber-50 rounded-2xl text-amber-500">
+                                    <Zap size={20} />
+                                  </div>
+                                  <div>
+                                    <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Engagement Pulse</p>
+                                    <p className="text-sm font-black text-gray-800">High Engagement ({profileData.contact.engagement_score}%)</p>
+                                  </div>
+                                </div>
+                                <div className="flex gap-1">
+                                  {[...Array(5)].map((_, i) => (
+                                    <div key={i} className={`w-1.5 h-4 rounded-full ${i < Math.min(5, Math.ceil(profileData.contact.engagement_score / 20)) ? 'bg-amber-400' : 'bg-gray-200'}`} />
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            <button
+                              onClick={() => {
+                                setActiveTab?.(AppTab.OMS);
+                              }}
+                              className="w-full py-4 bg-gray-900 text-white rounded-2xl font-black text-xs uppercase tracking-[0.2em] shadow-xl hover:bg-black transition-all flex items-center justify-center gap-2 group"
+                            >
+                              <Plus size={16} className="group-hover:rotate-90 transition-transform" /> Create New Order
+                            </button>
+                          </motion.div>
                         )}
-                      </div>
+
+                        {activeProfileTab === 'finance' && (
+                          <motion.div
+                            key="finance"
+                            initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }}
+                            className="space-y-6"
+                          >
+                            <FinancialSnapshot dna={profileData.financialDNA} />
+                            <div className="bg-white p-6 rounded-[2rem] border border-gray-100 shadow-sm">
+                              <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-6 flex items-center gap-2">
+                                <FileText size={14} /> Unified Financial Ledger
+                              </h4>
+                              <div className="max-h-[500px] overflow-y-auto pr-2 custom-scrollbar">
+                                <FinancialLedger events={(profileData.financialLedger || []).filter(ev => {
+                                  // In the global customer profile, we only want to show the ORIGINAL cash flow.
+                                  // We hide 'transfer' methods (from merges) and '[LINKED]' notes (from propagation).
+                                  const isTransfer = ev.method === 'transfer';
+                                  const isPropagated = ev.notes?.includes('[LINKED]');
+                                  return !isTransfer && !isPropagated;
+                                })} />
+                              </div>
+                            </div>
+                          </motion.div>
+                        )}
+
+                        {activeProfileTab === 'messages' && (
+                          <motion.div
+                            key="messages"
+                            initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -20 }}
+                            className="space-y-4"
+                          >
+                            <h4 className="text-[10px] font-black text-gray-400 uppercase tracking-widest mb-4 flex items-center gap-2">
+                              <MessageSquare size={14} /> Recent Interaction History
+                            </h4>
+                            {profileData.history && profileData.history.length > 0 ? (
+                              profileData.history.map((msg: any) => (
+                                <div key={msg.id} className={`p-4 rounded-2xl relative ${msg.type === 'sent' ? 'bg-wa-teal/10 ml-8 rounded-tr-none border border-wa-teal/20' : 'bg-white mr-8 rounded-tl-none border border-gray-200 shadow-sm'}`}>
+                                  <div className="flex justify-between items-start mb-2">
+                                    <span className="text-[10px] font-black text-gray-400 uppercase tracking-widest">
+                                      {new Date(msg.timestamp).toLocaleDateString()}
+                                    </span>
+                                    {msg.type === 'sent' && (
+                                      <span className={`text-[10px] font-black uppercase ${msg.status === 'read' ? 'text-blue-500' : 'text-gray-400'}`}>
+                                        {msg.status}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className="text-sm font-medium text-gray-700 break-words">{msg.text || (msg.media_path ? '[Media]' : '[Empty]')}</p>
+                                </div>
+                              ))
+                            ) : (
+                              <div className="text-center p-12 bg-white rounded-[2rem] border border-dashed border-gray-200">
+                                <p className="text-xs font-black uppercase tracking-widest text-gray-300">No message history</p>
+                              </div>
+                            )}
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
                     </div>
                   </div>
 
@@ -1900,15 +2018,16 @@ const ContactsView: React.FC<ContactsViewProps> = ({ contacts, setContacts, grou
                     </button>
                     <button
                       onClick={() => {
-                        (window as any).setSelectedChat(profileData.contact.number);
-                        (window as any).setActiveTab('messages');
+                        setSelectedChat?.(profileData.contact.phone || profileData.contact.number);
+                        setActiveTab?.(AppTab.MESSAGES);
                       }}
                       className="flex-2 bg-wa-teal hover:bg-emerald-600 text-white py-3 px-6 rounded-xl text-[10px] font-black uppercase tracking-widest shadow-lg shadow-wa-teal/20 transition-all flex items-center justify-center gap-2"
                     >
                       <Zap size={14} /> Start Chat
                     </button>
                   </div>
-                </>
+                </div>
+              </>
               ) : (
                 <div className="flex-1 flex items-center justify-center text-gray-400 font-bold">Failed to load profile.</div>
               )}

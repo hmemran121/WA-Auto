@@ -2,7 +2,7 @@ const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const { io } = require('socket.io-client');
 const qrcode = require('qrcode');
 const path = require('path');
-const fs = require('fs');
+const fs = require('fs-extra');
 const { execSync } = require('child_process');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
@@ -19,12 +19,72 @@ const finalFfprobePath = fs.existsSync(ffprobeBinary) ? ffprobeBinary : (ffprobe
 console.log('[WA-PRO] FFmpeg Path:', finalFfmpegPath);
 console.log('[WA-PRO] FFprobe Path:', finalFfprobePath);
 
+process.on('uncaughtException', (err) => {
+    console.error('[CRITICAL] 💥 Uncaught Exception in whatsapp-service.js:', err);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('[CRITICAL] 💥 Unhandled Rejection in whatsapp-service.js:', reason);
+});
+
 const phoneFormatter = require('./utils/phoneFormatter');
 
 ffmpeg.setFfmpegPath(finalFfmpegPath);
 ffmpeg.setFfprobePath(finalFfprobePath);
 
+const getChromePath = () => {
+    const paths = [
+        'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+        'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
+        'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'
+    ];
+    for (const p of paths) {
+        if (fs.existsSync(p)) {
+            console.log(`[WA-PRO] Found Chrome/Edge at: ${p}`);
+            return p;
+        }
+    }
+    console.warn('[WA-PRO] Warning: Chrome/Edge not found in default paths. Relying on Puppeteer default.');
+    return undefined; // Let puppeteer decide if not found
+};
+
 const socket = io('http://localhost:3001');
+
+// --- Intelligent Message Queueing (TTL: 10m) ---
+let messageQueue = [];
+const QUEUE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_QUEUE_SIZE = 50;
+
+const addToQueue = (data) => {
+    if (messageQueue.length >= MAX_QUEUE_SIZE) {
+        console.warn('[WA-PRO] Queue Full. Dropping oldest message.');
+        messageQueue.shift();
+    }
+    messageQueue.push({ ...data, timestamp: Date.now() });
+    console.log(`[WA-PRO] Message queued (${messageQueue.length} total). Reason: Client not ready.`);
+};
+
+const flushQueue = async () => {
+    if (messageQueue.length === 0) return;
+    if (lastState.state !== 'ready') return;
+
+    console.log(`[WA-PRO] 🚀 Flushing queued messages (${messageQueue.length} total)...`);
+    const now = Date.now();
+    const toProcess = [...messageQueue];
+    messageQueue = [];
+
+    for (const msg of toProcess) {
+        // Check TTL
+        if (now - msg.timestamp > QUEUE_TTL_MS) {
+            console.log(`[WA-PRO] Skipping stale queued message to ${msg.number || msg.chatId} (Expired)`);
+            continue;
+        }
+
+        // Re-emit internally to the send handler
+        socket.emit('service_send_message', msg);
+    }
+};
 
 const client = new Client({
     authStrategy: new LocalAuth({
@@ -35,9 +95,10 @@ const client = new Client({
     qrMaxRetries: 5,
     webVersionCache: {
         type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1012170943-alpha.html',
+        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.3000.1015901307-alpha.html', 
     },
     puppeteer: {
+        executablePath: getChromePath(),
         headless: true,
         handleSIGINT: false,
         args: [
@@ -57,12 +118,79 @@ const client = new Client({
             '--disable-domain-reliability',
             '--disable-sync',
             '--shm-size=1gb',
-            // Added for stability and injection reliability
-            '--disable-features=IsolateOrigins,site-per-process',
-            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            // Added for stability and injection reliability (ENTERPRISE STANDARD)
+            '--disable-features=IsolateOrigins,site-per-process,Translate,OptimizationHints',
+            '--disable-ipc-flooding-protection',
+            '--disable-renderer-backgrounding',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--no-pings',
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36'
         ]
     }
 });
+
+// --- Zero-Crash Watchdog & Maintenance Layer ---
+let watchdogInterval = null;
+let consecutiveHealthFailures = 0;
+let lastMaintenanceAt = Date.now();
+const MAINTENANCE_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 Hours
+const HEALTH_CHECK_INTERVAL_MS = 90 * 1000; // 90 Seconds
+let consecutiveFatalErrors = 0; // NEW: Track send 't' errors
+
+const startWatchdog = () => {
+    if (watchdogInterval) clearInterval(watchdogInterval);
+    
+    console.log('[WA-Watchdog] 🛡️ Enterprise Health Sentinel started.');
+    
+    watchdogInterval = setInterval(async () => {
+        if (lastState.state !== 'ready' || isInitializing) return;
+
+        // 1. Predictive Maintenance Check
+        if (Date.now() - lastMaintenanceAt > MAINTENANCE_INTERVAL_MS) {
+            console.log('[WA-Watchdog] 🔄 Triggering scheduled daily maintenance recycling...');
+            triggerAggressiveRestart("Scheduled Maintenance");
+            return;
+        }
+
+        // 2. Proactive Health Check (Heartbeat)
+        try {
+            const state = await client.getState();
+            if (state) {
+                consecutiveHealthFailures = 0;
+                // console.log('[WA-Watchdog] Heartbeat: Healthy');
+            } else {
+                throw new Error("Client state returned null/undfined");
+            }
+        } catch (err) {
+            consecutiveHealthFailures++;
+            console.warn(`[WA-Watchdog] ⚠️ Health check failure (${consecutiveHealthFailures}/2): ${err.message}`);
+            
+            if (consecutiveHealthFailures >= 2) {
+                console.error('[WA-Watchdog] 🚨 Critical instability detected. Triggering self-healing restart...');
+                triggerAggressiveRestart("Heartbeat Failure (Detached Frame)");
+            }
+        }
+    }, HEALTH_CHECK_INTERVAL_MS);
+};
+
+const triggerAggressiveRestart = async (reason) => {
+    console.log(`[WA-Service] 🚑 EXECUTING AGGRESSIVE RECOVERY. Reason: ${reason}`);
+    
+    if (watchdogInterval) clearInterval(watchdogInterval);
+    watchdogInterval = null;
+    consecutiveHealthFailures = 0;
+    lastMaintenanceAt = Date.now(); // Reset maintenance clock
+
+    try {
+        await client.destroy();
+    } catch (e) {
+        console.warn('[WA-Service] Client destroy failed (already dead?):', e.message);
+    }
+    
+    isInitializing = false;
+    robustInitialize(0);
+};
 
 /**
  * PRODUCTION-GRADE: Ensures no orphan browser processes or stale lock files
@@ -75,15 +203,11 @@ const ensureBrowserCleanState = async () => {
     if (process.platform === 'win32') {
         try {
             console.log('[WA-Service] 🧹 Checking for orphan browser processes association...');
-            // PRODUCTION-GRADE: Target processes that have our session path in their command line to release directory handles
-            // We use a more robust powershell command to find and kill processes
-            const psCmd = `powershell -Command "Get-CimInstance Win32_Process -Filter \\"Name LIKE '%chrome%' OR Name LIKE '%chromium%'\\" | Where-Object { $_.CommandLine -like '*session-wa-auto-client*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"`;
+            // Target processes that have our session path or .wwebjs_auth in their command line
+            const psCmd = `powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*session-wa-auto-client*' -or $_.CommandLine -like '*.wwebjs_auth*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"`;
             execSync(psCmd, { stdio: 'ignore' });
-            // Small pause to let OS release file handles
-            await new Promise(r => setTimeout(r, 2000));
-        } catch (e) {
-            // Often errors if no matching process is found, which is fine
-        }
+            await new Promise(r => setTimeout(r, 1000));
+        } catch (e) {}
     }
 
     const sessionPath = path.join(__dirname, '.wwebjs_auth', 'session-wa-auto-client');
@@ -140,6 +264,60 @@ const robustInitialize = async (retryCount = 0) => {
             }, 1000 * 60 * 60); // Every hour
         }
 
+        // --- Proactive Session Audit & Intelligent Migration ---
+        const authBase = path.join(__dirname, '.wwebjs_auth');
+        const sessionPath = path.join(authBase, 'session-wa-auto-client');
+        const legacyPath = path.join(authBase, 'session');
+        const migrationMarker = path.join(authBase, '.migrated_legacy');
+        
+        // Count files and check folder size to determine if it's a real session
+        const getSessionQuality = (dir) => {
+            try {
+                if (!fs.existsSync(dir)) return 0;
+                const levelDbPath = path.join(dir, 'Default', 'IndexedDB', 'https_web.whatsapp.com_0.indexeddb.leveldb');
+                if (!fs.existsSync(levelDbPath)) return 0;
+                const files = fs.readdirSync(levelDbPath);
+                let totalSize = 0;
+                files.forEach(f => {
+                    try { totalSize += fs.statSync(path.join(levelDbPath, f)).size; } catch(e){}
+                });
+                return totalSize;
+            } catch (e) { return 0; }
+        };
+
+        const activeQuality = getSessionQuality(sessionPath);
+        const legacyQuality = getSessionQuality(legacyPath);
+        
+        console.log(`[WA-Service] Session Audit: ActiveQuality=${activeQuality}, LegacyQuality=${legacyQuality}`);
+
+        // Migration occurs ONLY ONCE if legacy session exists, active is missing/empty, and hasn't been archived yet
+        const needsLegacyMigration = !fs.existsSync(migrationMarker) && legacyQuality > 500000 && activeQuality < 100000;
+
+        if (needsLegacyMigration) {
+            console.log(`[WA-Service] 🚚 RELOCATING LEGACY CACHE: Moving robust data from 'session' (${legacyQuality}B) to 'session-wa-auto-client'...`);
+            try {
+                fs.emptyDirSync(sessionPath);
+                fs.copySync(legacyPath, sessionPath);
+                fs.writeFileSync(migrationMarker, Date.now().toString());
+                const legacyBak = path.join(authBase, 'session_migrated_bak');
+                if (fs.existsSync(legacyBak)) fs.removeSync(legacyBak);
+                fs.moveSync(legacyPath, legacyBak);
+                console.log(`[WA-Service] ✅ Legacy robust cache migrated and safely archived.`);
+            } catch (e) {
+                console.error(`[WA-Service] ❌ Migration failed:`, e.message);
+            }
+        }
+
+        let hasSession = getSessionQuality(sessionPath) > 150000;
+
+        if (hasSession) {
+            console.log(`[WA-Service] 📦 Robust session detected. Attempting auto-connection...`);
+            updateState('initial', 'Session detected. Resuming...');
+        } else {
+            console.warn(`[WA-Service] ⚠️ No robust session found. Manual login will likely be required.`);
+            updateState('initial', 'No active session. Preparing QR code...');
+        }
+
         console.log(`[WA-Service] Initializing client (Attempt ${retryCount + 1})...`);
         
         // Ensure clean state before start
@@ -168,16 +346,17 @@ const robustInitialize = async (retryCount = 0) => {
             }
         }
 
-        // Handle specific injection failure or "Target closed"
         if (err.message.includes('Execution context was destroyed') || 
             err.message.includes('navigation') || 
             err.message.includes('Target closed') ||
+            err.message.includes('detached Frame') ||
             err.message.includes('Protocol error')) {
             
-            errorMessage = "Communication error with browser (Target closed). Retrying...";
+            errorMessage = "Communication error with browser (Target closed / detached). Retrying...";
             if (retryCount < 3) {
                 const delay = (retryCount + 1) * 3000; // Increased delay
                 console.log(`[WA-Service] ⚠️ Critical communication failure. Retrying in ${delay}ms...`);
+                await ensureBrowserCleanState();
                 await new Promise(r => setTimeout(r, delay));
                 return robustInitialize(retryCount + 1);
             }
@@ -218,7 +397,11 @@ const updateState = (state, data = null) => {
     lastState = payload;
     if (state === 'ready' || state === 'authenticated' || state === 'error') {
         isInitializing = false;
-        if (state === 'ready') initAttempts = 0;
+        if (state === 'ready') {
+            initAttempts = 0;
+            // Auto-flush queue when ready
+            flushQueue();
+        }
     }
     socket.emit('service_status_update', lastState);
 };
@@ -282,9 +465,30 @@ const convertAudioToOgg = (inputPath) => {
     });
 };
 
+// 🛡️ Enterprise Resilient Socket Message Queue (Zero Message Loss)
+const pendingSocketMessagesQueue = [];
+
+function emitOrQueueMessage(event, payload) {
+    if (socket.connected) {
+        socket.emit(event, payload);
+    } else {
+        console.warn(`[WA-Service] ⚠️ Socket disconnected during ${event}. Queueing message for retry on reconnect...`);
+        pendingSocketMessagesQueue.push({ event, payload, timestamp: Date.now() });
+    }
+}
+
 socket.on('connect', () => {
     console.log('[WA-Service] Connected to API Hub');
     socket.emit('service_status_update', lastState);
+
+    // Flush any pending messages that arrived while disconnected
+    if (pendingSocketMessagesQueue.length > 0) {
+        console.log(`[WA-Service] 🔄 Flushing ${pendingSocketMessagesQueue.length} pending socket messages to API Hub...`);
+        while (pendingSocketMessagesQueue.length > 0) {
+            const item = pendingSocketMessagesQueue.shift();
+            socket.emit(item.event, item.payload);
+        }
+    }
 });
 
 socket.on('disconnect', () => {
@@ -390,7 +594,7 @@ client.on('message', async (msg) => {
         }
     }
 
-    socket.emit('service_new_message', {
+    emitOrQueueMessage('service_new_message', {
         from,
         text,
         whatsappId: msg.id._serialized,
@@ -458,7 +662,7 @@ socket.on('service_restart', async (data = {}) => {
             try {
                 // Ensure browser is dead before deleting files
                 if (process.platform === 'win32') {
-                    const psCmd = `powershell -Command "Get-CimInstance Win32_Process -Filter \\"CommandLine LIKE '%session-wa-auto-client%\\'\\" | Stop-Process -Force erroraction silentlycontinue"`;
+                    const psCmd = `powershell -Command "Get-CimInstance Win32_Process -Filter \\"Name LIKE '%chrome%' OR Name LIKE '%chromium%'\\" | Where-Object { $_.CommandLine -like '*session-wa-auto-client*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"`;
                     execSync(psCmd, { stdio: 'ignore' });
                     await new Promise(r => setTimeout(r, 1000));
                 }
@@ -479,389 +683,524 @@ socket.on('service_restart', async (data = {}) => {
     robustInitialize().catch(err => console.error('[WA-Service] Init error:', err));
 });
 
-socket.on('service_send_message', async (data) => {
-    if (lastState.state !== 'ready' && lastState.state !== 'authenticated') {
-        console.warn('[WA-PRO] Cannot send message: Client is not ready yet. Current state:', lastState.state);
-        socket.emit('service_message_result', {
-            success: false,
-            error: `WhatsApp client is not ready yet (Current state: ${lastState.state}). Please wait a moment for it to connect.`,
-            originalData: data
-        });
-        return;
+// --- INTELLIGENT JID RESOLUTION (GLOBAL) ---
+const resolveChatId = async (id) => {
+    if (!id || typeof id !== 'string') return null;
+    
+    const cleanId = id.trim();
+    if (cleanId === '@c.us' || cleanId === '@g.us' || cleanId === '@lid') {
+        console.warn(`[WA-PRO] Rejecting malformed JID: ${cleanId}`);
+        return null;
     }
 
-    // If authenticated but not ready, log it but proceed (experimental tolerance)
-    if (lastState.state === 'authenticated') {
-        console.log('[WA-PRO] Proceeding with send in "authenticated" state (not yet "ready")...');
+    const pureNumber = cleanId.split('@')[0].replace(/[^\d]/g, '');
+    if (!pureNumber) return null;
+
+    // 🔒 LID GUARD: 15-17 digit WhatsApp LIDs MUST use @lid suffix to prevent "No LID for user" errors!
+    if (phoneFormatter.isLid(pureNumber)) {
+        console.log(`[WA-PRO] LID Pattern detected: ${cleanId} -> ${pureNumber}@lid`);
+        return `${pureNumber}@lid`;
     }
 
-    const processSpintax = (msgText) => {
-        if (!msgText) return msgText;
-        let processed = msgText;
-        // Process nested spintax by repeatedly applying the regex until no more changes occur
-        let lastProcessed;
-        do {
-            lastProcessed = processed;
-            processed = processed.replace(/\{([^{}]+)\}/g, (match, contents) => {
-                const spinOptions = contents.split('|');
-                return spinOptions[Math.floor(Math.random() * spinOptions.length)];
-            });
-        } while (processed !== lastProcessed);
-
-        return processed;
-    };
-
-    /**
-     * Variable Mapper: Replaces {{name}}, {{phone}}, {{firstName}} etc.
-     * with actual contact data.
-     */
-    const processVariables = (msgText, contactData) => {
-        if (!msgText) return msgText;
-        let processed = msgText;
-
-        // Basic mappings
-        const name = contactData.contactName || contactData.name || 'Customer';
-        const firstName = name.split(' ')[0];
-        const phone = contactData.to || contactData.number || '';
-        const city = contactData.city || '';
-        const companyName = contactData.companyName || '';
-        const address = contactData.address || '';
-        const email = contactData.email || '';
-        const lastPurchase = contactData.lastPurchase || '';
-
-        processed = processed.replace(/\{\{name\}\}/gi, name);
-        processed = processed.replace(/\{\{firstName\}\}/gi, firstName);
-        processed = processed.replace(/\{\{phone\}\}/gi, phone);
-        processed = processed.replace(/\{\{city\}\}/gi, city);
-        processed = processed.replace(/\{\{companyName\}\}/gi, companyName);
-        processed = processed.replace(/\{\{address\}\}/gi, address);
-        processed = processed.replace(/\{\{email\}\}/gi, email);
-        processed = processed.replace(/\{\{lastPurchase\}\}/gi, lastPurchase);
-
-        return processed;
-    };
-
-    let { chatId, text, options = {}, mediaPath, quotedMessageId, mediaType: incomingMediaType, attachments = [] } = data;
-
-    // Process Spintax and Variables before sending
-    text = processSpintax(text);
-    text = processVariables(text, data);
-
-    // Handle backward compatibility (single mediaPath -> attachments array)
-    if (mediaPath && attachments.length === 0) {
-        attachments.push({ url: mediaPath, type: incomingMediaType });
+    // 1. Check if it's a group or already explicitly formatted with @g.us / @lid
+    if (cleanId.endsWith('@g.us') || cleanId.endsWith('@lid')) {
+        return cleanId;
     }
 
-    // Robust MIME detection FALLBACK
-    const getMimeFromExt = (filePath) => {
-        const ext = path.extname(filePath).toLowerCase();
-        const map = {
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
-            '.png': 'image/png',
-            '.gif': 'image/gif',
-            '.pdf': 'application/pdf',
-            '.mp4': 'video/mp4',
-            '.ogg': 'audio/ogg; codecs=opus',
-            '.webm': 'audio/webm'
-        };
-        return map[ext] || 'application/octet-stream';
-    };
-
-    console.log(`[WA-PRO] SEND ATTEMPT: ${chatId} | Attachments: ${attachments.length} | Quote: ${quotedMessageId}`);
-
-    let tempFiles = [];
-
-    const sendOptions = { ...options };
-    if (quotedMessageId) {
-        sendOptions.quotedMessageId = quotedMessageId;
-    }
-
+    // 2. Proactive Resolution via whatsapp-web.js getNumberId
     try {
-        let anySent = false;
-        let textConsumed = false;
+        const numberId = await client.getNumberId(pureNumber);
+        if (numberId && numberId._serialized) {
+            console.log(`[WA-PRO] JID Resolved via getNumberId: ${cleanId} -> ${numberId._serialized}`);
+            return numberId._serialized;
+        }
+    } catch (e) {
+        console.warn(`[WA-PRO] getNumberId resolution warning for ${pureNumber}:`, e.message);
+    }
 
-        if (attachments.length > 0) {
-            // Loop through each attachment
-            for (let i = 0; i < attachments.length; i++) {
-                const attach = attachments[i];
-                let mediaObject;
-                let isOgg = false; // Lifted scope
-                let finalCaption = null;
-                let finalMediaType = null;
-                const currentSendOptions = { ...options };
-                if (quotedMessageId) currentSendOptions.quotedMessageId = quotedMessageId;
+    // Default to @c.us for standard numbers
+    return `${pureNumber}@c.us`;
+};
 
-                if (attach.type === 'location') {
-                    console.log(`[WA-PRO] Location Attachment detected: ${attach.name} (Lat: ${attach.lat}, Lng: ${attach.lng})`);
-                    const { Location } = require('whatsapp-web.js');
-                    // Use Number() to retain maximum precision provided by the frontend instead of parseFloat
-                    mediaObject = new Location(Number(attach.lat) || 0, Number(attach.lng) || 0, attach.name || 'Shared Location');
-                    finalMediaType = 'location';
+socket.on('service_send_message', async (data) => {
+    try {
+        // --- QUEUE GUARD ---
+        // If client is not ready, queue the message for later
+        if (lastState.state !== 'ready') {
+            addToQueue(data);
+            return;
+        }
 
-                    // Note: Locations do not support native captions in WA. Text will be sent separately.
-                    // Do NOT set textConsumed = true here so it triggers the standalone text block.
-                } else if (attach.type === 'vcard') {
-                    const vName = attach.name || 'Unknown Contact';
-                    const vPhone = attach.phone ? String(attach.phone).replace(/\D/g, '') : '';
+        // RESOLVE JID DYNAMICALLY
+        const targetChatId = await resolveChatId(data.chatId || data.to);
+        if (!targetChatId) {
+            throw new Error(`Invalid Target Chat ID provided: ${data.chatId}`);
+        }
 
-                    console.log(`[WA-PRO] VCard Attachment detected: ${vName} (${vPhone})`);
+        // --- PRE-SEND HEALTH CHECK (Law 14.3/14.4) ---
+        try {
+            const state = await client.getState();
+            if (state !== 'CONNECTED') {
+                console.warn(`[WA-PRO] ⚠️ Health Check: Client state is ${state}. Queuing message.`);
+                addToQueue(data);
+                return;
+            }
+        } catch (e) {
+            console.warn('[WA-PRO] ⚠️ Health Check: Failed to get state. Assuming disconnected.');
+            addToQueue(data);
+            return;
+        }
 
-                    if (!vPhone) {
-                        console.warn(`[WA-PRO] VCard skipped: No valid phone number for ${vName}`);
-                        continue;
-                    }
+        const processSpintax = (msgText) => {
+            if (!msgText) return msgText;
+            let processed = msgText;
+            // Process nested spintax by repeatedly applying the regex until no more changes occur
+            let lastProcessed;
+            do {
+                lastProcessed = processed;
+                processed = processed.replace(/\{([^{}]+)\}/g, (match, contents) => {
+                    const spinOptions = contents.split('|');
+                    return spinOptions[Math.floor(Math.random() * spinOptions.length)];
+                });
+            } while (processed !== lastProcessed);
 
-                    mediaObject = `BEGIN:VCARD\nVERSION:3.0\nFN:${vName}\nTEL;type=CELL;type=VOICE;waid=${vPhone}:+${vPhone}\nEND:VCARD`;
-                    currentSendOptions.parseVCards = true;
-                    finalMediaType = 'vcard';
-                } else {
-                    // Robust path resolution: support absolute paths, relative paths, and local server URLs
-                    let effectiveUrl = attach.url;
-                    let fullPath = '';
+            return processed;
+        };
 
-                    if (effectiveUrl.startsWith('http')) {
-                        try {
-                            const urlObj = new URL(effectiveUrl);
-                            // If it's on localhost, we treat it as a local file
-                            if (urlObj.hostname === 'localhost' || urlObj.hostname === '127.0.0.1') {
-                                const uploadsIdx = urlObj.pathname.indexOf('/uploads/');
-                                if (uploadsIdx !== -1) {
-                                    // Extract everything from 'uploads/' onwards
-                                    const relativePath = urlObj.pathname.slice(uploadsIdx + 1); // remove leading slash
-                                    fullPath = path.resolve(__dirname, relativePath);
+        const processVariables = (msgText, contactData) => {
+            if (!msgText) return msgText;
+            let processed = msgText;
+
+            // Basic mappings
+            const name = contactData.contactName || contactData.name || 'Customer';
+            const firstName = name.split(' ')[0];
+            const phone = contactData.to || contactData.number || '';
+            const city = contactData.city || '';
+            const companyName = contactData.companyName || '';
+            const address = contactData.address || '';
+            const email = contactData.email || '';
+            const lastPurchase = contactData.lastPurchase || '';
+
+            processed = processed.replace(/\{\{name\}\}/gi, name);
+            processed = processed.replace(/\{\{firstName\}\}/gi, firstName);
+            processed = processed.replace(/\{\{phone\}\}/gi, phone);
+            processed = processed.replace(/\{\{city\}\}/gi, city);
+            processed = processed.replace(/\{\{companyName\}\}/gi, companyName);
+            processed = processed.replace(/\{\{address\}\}/gi, address);
+            processed = processed.replace(/\{\{email\}\}/gi, email);
+            processed = processed.replace(/\{\{lastPurchase\}\}/gi, lastPurchase);
+
+            return processed;
+        };
+
+        let { chatId: rawChatId, text: msgText, options: msgOptions = {}, mediaPath: msgMediaPath, quotedMessageId, mediaType: incomingMediaType, attachments = [] } = data;
+
+        // Process Spintax and Variables before sending
+        msgText = processSpintax(msgText);
+        msgText = processVariables(msgText, data);
+
+        // Handle backward compatibility (single mediaPath -> attachments array)
+        if (msgMediaPath && attachments.length === 0) {
+            attachments.push({ url: msgMediaPath, type: incomingMediaType });
+        }
+
+        // Robust MIME detection FALLBACK
+        const getMimeFromExt = (filePath) => {
+            const ext = path.extname(filePath).toLowerCase();
+            const map = {
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.png': 'image/png',
+                '.gif': 'image/gif',
+                '.pdf': 'application/pdf',
+                '.mp4': 'video/mp4',
+                '.ogg': 'audio/ogg; codecs=opus',
+                '.webm': 'audio/webm'
+            };
+            return map[ext] || 'application/octet-stream';
+        };
+
+        console.log(`[WA-PRO] SEND ATTEMPT: ${targetChatId} (Original: ${rawChatId}) | Attachments: ${attachments.length} | Quote: ${quotedMessageId}`);
+
+
+
+        let tempFiles = [];
+
+        const sendOptions = { ...msgOptions };
+        if (quotedMessageId) {
+            sendOptions.quotedMessageId = quotedMessageId;
+        }
+
+        try {
+            let anySent = false;
+            let textConsumed = false;
+
+            if (attachments.length > 0) {
+                // Loop through each attachment
+                for (let i = 0; i < attachments.length; i++) {
+                    const attach = attachments[i];
+                    let mediaObject;
+                    let isOgg = false; // Lifted scope
+                    let finalCaption = null;
+                    let finalMediaType = null;
+                    const currentSendOptions = { ...msgOptions };
+                    if (quotedMessageId) currentSendOptions.quotedMessageId = quotedMessageId;
+
+                    if (attach.type === 'location') {
+                        console.log(`[WA-PRO] Location Attachment detected: ${attach.name} (Lat: ${attach.lat}, Lng: ${attach.lng})`);
+                        const { Location } = require('whatsapp-web.js');
+                        // Use Number() to retain maximum precision provided by the frontend instead of parseFloat
+                        mediaObject = new Location(Number(attach.lat) || 0, Number(attach.lng) || 0, attach.name || 'Shared Location');
+                        finalMediaType = 'location';
+
+                        // Note: Locations do not support native captions in WA. Text will be sent separately.
+                        // Do NOT set textConsumed = true here so it triggers the standalone text block.
+                    } else if (attach.type === 'vcard') {
+                        const vName = attach.name || 'Unknown Contact';
+                        const vPhone = attach.phone ? String(attach.phone).replace(/\D/g, '') : '';
+
+                        console.log(`[WA-PRO] VCard Attachment detected: ${vName} (${vPhone})`);
+
+                        if (!vPhone) {
+                            console.warn(`[WA-PRO] VCard skipped: No valid phone number for ${vName}`);
+                            continue;
+                        }
+
+                        mediaObject = `BEGIN:VCARD\nVERSION:3.0\nFN:${vName}\nTEL;type=CELL;type=VOICE;waid=${vPhone}:+${vPhone}\nEND:VCARD`;
+                        currentSendOptions.parseVCards = true;
+                        finalMediaType = 'vcard';
+                    } else {
+                        // Robust path resolution: support absolute paths, relative paths, and local server URLs
+                        let effectiveUrl = attach.url;
+                        let fullPath = '';
+
+                        if (effectiveUrl.startsWith('http')) {
+                            try {
+                                const urlObj = new URL(effectiveUrl);
+                                // If it's on localhost, we treat it as a local file
+                                if (urlObj.hostname === 'localhost' || urlObj.hostname === '127.0.0.1') {
+                                    const uploadsIdx = urlObj.pathname.indexOf('/uploads/');
+                                    if (uploadsIdx !== -1) {
+                                        // Extract everything from 'uploads/' onwards
+                                        const relativePath = urlObj.pathname.slice(uploadsIdx + 1); // remove leading slash
+                                        fullPath = path.resolve(__dirname, relativePath);
+                                    }
                                 }
+                            } catch (e) {
+                                console.warn(`[WA-PRO] Failed to parse attachment URL: ${effectiveUrl}`);
                             }
-                        } catch (e) {
-                            console.warn(`[WA-PRO] Failed to parse attachment URL: ${effectiveUrl}`);
+                        }
+
+                        // Fallback to direct path joining if fullPath wasn't resolved from URL
+                        if (!fullPath) {
+                            if (effectiveUrl.startsWith('/uploads/')) {
+                                fullPath = path.resolve(__dirname, effectiveUrl.slice(1));
+                            } else if (path.isAbsolute(effectiveUrl) && effectiveUrl.match(/^[a-zA-Z]:\\/)) {
+                                fullPath = effectiveUrl;
+                            } else {
+                                const sanitizedUrl = effectiveUrl.startsWith('/') ? effectiveUrl.slice(1) : effectiveUrl;
+                                fullPath = path.resolve(__dirname, sanitizedUrl);
+                            }
+                        }
+
+                        if (!fs.existsSync(fullPath)) {
+                            require('fs').appendFileSync(require('path').join(__dirname, 'debug.log'), `\n[WA-PRO] File not found: ${fullPath}\n`);
+                            console.warn(`[WA-PRO] File not found: ${fullPath}, Skipping attachment.`);
+                            continue;
+                        }
+
+                        // DYNAMIC FIX: Auto-detect if this is a voice note from filename or type
+                        const isVoiceFile = attach.url.includes('voice-note') || attach.url.includes('voice-template') || (attach.type && attach.type.includes('audio'));
+                        if (isVoiceFile && msgOptions.sendAudioAsVoice === undefined) {
+                            msgOptions.sendAudioAsVoice = true;
+                            currentSendOptions.sendAudioAsVoice = true;
+                        }
+
+                        // If it's a voice note, convert to OGG Opus for native PTT support
+                        if (msgOptions.sendAudioAsVoice) {
+                            console.log(`[WA-PRO] Voice Note detected. Starting conversion for: ${path.basename(fullPath)}`);
+                            try {
+                                const convertedPath = await convertAudioToOgg(fullPath);
+                                fullPath = convertedPath;
+                                tempFiles.push(convertedPath);
+                                console.log('[WA-PRO] Audio conversion SUCCESS. Using OGG for PTT.');
+                            } catch (convErr) {
+                                console.warn('[WA-PRO] Audio conversion FAILED. Falling back to original file:', convErr.message);
+                            }
+                        }
+
+                        // Create media object
+                        const mediaData = fs.readFileSync(fullPath);
+                        const base64Data = mediaData.toString('base64');
+                        isOgg = fullPath.endsWith('.ogg');
+                        const mimetype = isOgg ? 'audio/ogg; codecs=opus' : (attach.type || getMimeFromExt(attach.url) || 'application/octet-stream');
+
+                        mediaObject = new MessageMedia(mimetype, base64Data, path.basename(fullPath));
+                        finalMediaType = mimetype;
+
+                        // Only attach text as caption to the first attachment (if it's not a PTT) OR use specific attachment caption
+                        if (attach.caption) {
+                            finalCaption = attach.caption;
+                        } else if (i === 0 && msgText && !msgOptions.sendAudioAsVoice) {
+                            // Only consume primary text as FIRST attachment's caption if NOT a voice note
+                            finalCaption = msgText;
+                            textConsumed = true;
                         }
                     }
 
-                    // Fallback to direct path joining if fullPath wasn't resolved from URL
-                    if (!fullPath) {
-                        if (effectiveUrl.startsWith('/uploads/')) {
-                            fullPath = path.resolve(__dirname, effectiveUrl.slice(1));
-                        } else if (path.isAbsolute(effectiveUrl) && effectiveUrl.match(/^[a-zA-Z]:\\/)) {
-                            fullPath = effectiveUrl;
-                        } else {
-                            const sanitizedUrl = effectiveUrl.startsWith('/') ? effectiveUrl.slice(1) : effectiveUrl;
-                            fullPath = path.resolve(__dirname, sanitizedUrl);
-                        }
-                    }
+                    // Let native caption check proceed (Locations will have finalCaption = null)
 
-                    if (!fs.existsSync(fullPath)) {
-                        require('fs').appendFileSync(require('path').join(__dirname, 'debug.log'), `\n[WA-PRO] File not found: ${fullPath}\n`);
-                        console.warn(`[WA-PRO] File not found: ${fullPath}, Skipping attachment.`);
-                        continue;
-                    }
-
-                    // DYNAMIC FIX: Auto-detect if this is a voice note from filename or type
-                    const isVoiceFile = attach.url.includes('voice-note') || attach.url.includes('voice-template') || (attach.type && attach.type.includes('audio'));
-                    if (isVoiceFile && options.sendAudioAsVoice === undefined) {
-                        options.sendAudioAsVoice = true;
-                        currentSendOptions.sendAudioAsVoice = true;
-                    }
-
-                    // If it's a voice note, convert to OGG Opus for native PTT support
-                    if (options.sendAudioAsVoice) {
-                        console.log(`[WA-PRO] Voice Note detected. Starting conversion for: ${path.basename(fullPath)}`);
-                        try {
-                            const convertedPath = await convertAudioToOgg(fullPath);
-                            fullPath = convertedPath;
-                            tempFiles.push(convertedPath);
-                            console.log('[WA-PRO] Audio conversion SUCCESS. Using OGG for PTT.');
-                        } catch (convErr) {
-                            console.warn('[WA-PRO] Audio conversion FAILED. Falling back to original file:', convErr.message);
-                        }
-                    }
-
-                    // Create media object
-                    const mediaData = fs.readFileSync(fullPath);
-                    const base64Data = mediaData.toString('base64');
-                    isOgg = fullPath.endsWith('.ogg');
-                    const mimetype = isOgg ? 'audio/ogg; codecs=opus' : (attach.type || getMimeFromExt(attach.url) || 'application/octet-stream');
-
-                    mediaObject = new MessageMedia(mimetype, base64Data, path.basename(fullPath));
-                    finalMediaType = mimetype;
-
-                    // Only attach text as caption to the first attachment (if it's not a PTT) OR use specific attachment caption
-                    if (attach.caption) {
-                        finalCaption = attach.caption;
-                    } else if (i === 0 && text && !options.sendAudioAsVoice) {
-                        // Only consume primary text as FIRST attachment's caption if NOT a voice note
-                        finalCaption = text;
-                        textConsumed = true;
-                    }
-                }
-
-                // Let native caption check proceed (Locations will have finalCaption = null)
-
-                // Native caption support check for non-PTT media
-                if (finalCaption && !options.sendAudioAsVoice) {
-                    currentSendOptions.caption = finalCaption;
-                } else {
-                    delete currentSendOptions.caption;
-                }
-
-                let sentMsg = null;
-
-                // 1. Primary send attempt (PTT)
-                try {
-                    if (currentSendOptions.sendAudioAsVoice) {
+                    // Native caption support check for non-PTT media
+                    if (finalCaption && !msgOptions.sendAudioAsVoice) {
+                        currentSendOptions.caption = finalCaption;
+                    } else {
                         delete currentSendOptions.caption;
-                        if (!isOgg) {
-                            console.warn('[WA-PRO] Warning: Sending as voice note without OGG conversion. This may fail.');
+                    }
+
+                    let sentMsg = null;
+
+                    // 1. Primary send attempt (PTT)
+                    try {
+                        if (currentSendOptions.sendAudioAsVoice) {
+                            delete currentSendOptions.caption;
+                            if (!isOgg) {
+                                console.warn('[WA-PRO] Warning: Sending as voice note without OGG conversion. This may fail.');
+                            }
+                        }
+
+                        console.log(`[WA-PRO] Step 1: Sending Attachment ${i + 1}/${attachments.length} (${mediaObject.mimetype || attach.type})...`);
+                        sentMsg = await client.sendMessage(targetChatId, mediaObject, currentSendOptions);
+                        console.log(`[WA-PRO] Step 1 SUCCESS for Attachment ${i + 1}`);
+                    } catch (err1) {
+                        const errStr = err1.stack || err1.message || err1.toString();
+                        require('fs').appendFileSync(require('path').join(__dirname, 'debug.log'), `\n[WA-PRO] ERROR Step 1: ${errStr}\n`);
+                        console.warn(`[WA-PRO] Step 1 FAILED for Attachment ${i + 1}:`, err1.message);
+
+                        // 2. Fallback attempt without PTT options
+                        try {
+                            console.log(`[WA-PRO] Step 2: Plain media fallback for Attachment ${i + 1}...`);
+                            await new Promise(r => setTimeout(r, 1000));
+                            sentMsg = await client.sendMessage(targetChatId, mediaObject, currentSendOptions);
+                            console.log(`[WA-PRO] Step 2 SUCCESS for Attachment ${i + 1}`);
+                        } catch (err2) {
+                            console.warn(`[WA-PRO] Step 2 FAILED for Attachment ${i + 1}:`, err2.message);
+
+                            // 3. Final fallback as document
+                            console.log(`[WA-PRO] Step 3: Document fallback for Attachment ${i + 1}...`);
+                            await new Promise(r => setTimeout(r, 1000));
+                            sentMsg = await client.sendMessage(targetChatId, mediaObject, { ...currentSendOptions, sendMediaAsDocument: true });
+                            console.log(`[WA-PRO] Step 3 SUCCESS for Attachment ${i + 1}`);
                         }
                     }
 
-                    console.log(`[WA-PRO] Step 1: Sending Attachment ${i + 1}/${attachments.length} (${mediaObject.mimetype || attach.type})...`);
-                    sentMsg = await client.sendMessage(chatId, mediaObject, currentSendOptions);
-                    console.log(`[WA-PRO] Step 1 SUCCESS for Attachment ${i + 1}`);
-                } catch (err1) {
-                    const errStr = err1.stack || err1.message || err1.toString();
-                    require('fs').appendFileSync(require('path').join(__dirname, 'debug.log'), `\n[WA-PRO] ERROR Step 1: ${errStr}\n`);
-                    console.warn(`[WA-PRO] Step 1 FAILED for Attachment ${i + 1}:`, err1.message);
+                    if (sentMsg) {
+                        anySent = true;
+                        let notifyName = null;
+                        try {
+                            const contact = await sentMsg.getContact();
+                            notifyName = contact.pushname || contact.name;
+                        } catch (cErr) { }
 
-                    // 2. Fallback attempt without PTT options
-                    try {
-                        console.log(`[WA-PRO] Step 2: Plain media fallback for Attachment ${i + 1}...`);
-                        await new Promise(r => setTimeout(r, 1000));
-                        sentMsg = await client.sendMessage(chatId, mediaObject, currentSendOptions);
-                        console.log(`[WA-PRO] Step 2 SUCCESS for Attachment ${i + 1}`);
-                    } catch (err2) {
-                        console.warn(`[WA-PRO] Step 2 FAILED for Attachment ${i + 1}:`, err2.message);
+                        // We clone original data and adapt it so the backend saves it as an isolated message
+                        const msgSpecificData = { ...data, ...attach };
+                        msgSpecificData.mediaUrl = attach.url;
+                        msgSpecificData.mediaType = finalMediaType;
+                        msgSpecificData.text = msgOptions.sendAudioAsVoice ? null : (finalCaption || null); // Don't save caption to audio bubble if PTT
+                        msgSpecificData.attachments = []; // Clear attachments so frontend DB only creates one bubble per iteration
 
-                        // 3. Final fallback as document
-                        console.log(`[WA-PRO] Step 3: Document fallback for Attachment ${i + 1}...`);
-                        await new Promise(r => setTimeout(r, 1000));
-                        sentMsg = await client.sendMessage(chatId, mediaObject, { ...currentSendOptions, sendMediaAsDocument: true });
-                        console.log(`[WA-PRO] Step 3 SUCCESS for Attachment ${i + 1}`);
+                        // Only emit success for the FIRST attachment or if we want every attachment logged separately.
+                        // Let's emit for each to ensure full delivery confirmation.
+                        socket.emit('service_message_result', {
+                            success: true,
+                            whatsappId: sentMsg.id._serialized,
+                            notifyName,
+                            queueId: data.queueId, // Pass back for Outbox confirmation
+                            originalData: msgSpecificData
+                        });
+                        console.log(`[WA-PRO] Attachment ${i + 1}/${attachments.length} SENT SUCCESSFULLY. ID: ${sentMsg.id._serialized}`);
+
+                        // Handle captions for voice notes (send as follow-up message since PTT doesn't support native captions)
+                        if (msgOptions.sendAudioAsVoice && finalCaption) {
+                            console.log(`[WA-PRO] Sending follow-up caption for voice note...`);
+                            await new Promise(r => setTimeout(r, 500));
+                            try {
+                                const captionMsg = await client.sendMessage(targetChatId, finalCaption, sendOptions);
+                                socket.emit('service_message_result', {
+                                    success: true,
+                                    whatsappId: captionMsg.id._serialized,
+                                    notifyName,
+                                    originalData: { ...data, mediaUrl: null, mediaType: null, text: finalCaption, attachments: [] }
+                                });
+                            } catch (capErr) {
+                                console.error('[WA-PRO] Failed to send follow-up caption:', capErr.message);
+                            }
+                        }
                     }
-                }
 
-                if (sentMsg) {
-                    anySent = true;
+                    // Add a small delay between multiple attachments to prevent rate limits
+                    if (i < attachments.length - 1) {
+                        await new Promise(r => setTimeout(r, 800));
+                    }
+
+                    // Production-Grade Buffer Cleanup
+                    mediaObject = null;
+                    if (global.gc) global.gc();
+                } // end loop
+
+                // If NO valid attachments were successfully sent, OR if the main text wasn't consumed as a caption, send it standalone
+                if ((!anySent && msgText) || (msgText && !textConsumed)) {
+                    console.log(`[WA-PRO] Sending standalone text (Attachments sent: ${anySent}, consumed: ${textConsumed})`);
+                    
+                    // Humanized Typing Simulation
+                    try {
+                        const chat = await client.getChatById(targetChatId);
+                        await chat.sendStateTyping();
+                        const delayMs = Math.min(Math.max(msgText.length * 40, 1000), 4000); // 40ms per char, max 4s
+                        await new Promise(r => setTimeout(r, delayMs));
+                    } catch(e) { /* ignore typing errors */ }
+
+                    const textMsg = await client.sendMessage(targetChatId, msgText, sendOptions);
                     let notifyName = null;
                     try {
-                        const contact = await sentMsg.getContact();
-                        notifyName = contact.pushname || contact.name;
+                        if (textMsg && typeof textMsg.getContact === 'function') {
+                            const contact = await textMsg.getContact();
+                            notifyName = contact.pushname || contact.name;
+                        }
                     } catch (cErr) { }
-
-                    // We clone original data and adapt it so the backend saves it as an isolated message
-                    const msgSpecificData = { ...data, ...attach };
-                    msgSpecificData.mediaUrl = attach.url;
-                    msgSpecificData.mediaType = finalMediaType;
-                    msgSpecificData.text = options.sendAudioAsVoice ? null : (finalCaption || null); // Don't save caption to audio bubble if PTT
-                    msgSpecificData.attachments = []; // Clear attachments so frontend DB only creates one bubble per iteration
-
-                    // Only emit success for the FIRST attachment or if we want every attachment logged separately.
-                    // Let's emit for each to ensure full delivery confirmation.
+                    const safeWaId = textMsg?.id?._serialized || textMsg?.id?.id || (`WA_SENT_${Date.now()}`);
                     socket.emit('service_message_result', {
                         success: true,
-                        whatsappId: sentMsg.id._serialized,
+                        whatsappId: safeWaId,
                         notifyName,
-                        originalData: msgSpecificData
+                        queueId: data.queueId, // Pass back for Outbox confirmation
+                        originalData: { ...data, mediaUrl: null, mediaType: null, attachments: [] }
                     });
-                    console.log(`[WA-PRO] Attachment ${i + 1}/${attachments.length} SENT SUCCESSFULLY. ID: ${sentMsg.id._serialized}`);
-
-                    // Handle captions for voice notes (send as follow-up message since PTT doesn't support native captions)
-                    if (options.sendAudioAsVoice && finalCaption) {
-                        console.log(`[WA-PRO] Sending follow-up caption for voice note...`);
-                        await new Promise(r => setTimeout(r, 500));
-                        try {
-                            const captionMsg = await client.sendMessage(chatId, finalCaption, sendOptions);
-                            socket.emit('service_message_result', {
-                                success: true,
-                                whatsappId: captionMsg.id._serialized,
-                                notifyName,
-                                originalData: { ...data, mediaUrl: null, mediaType: null, text: finalCaption, attachments: [] }
-                            });
-                        } catch (capErr) {
-                            console.error('[WA-PRO] Failed to send follow-up caption:', capErr.message);
-                        }
-                    }
                 }
 
-                // Add a small delay between multiple attachments to prevent rate limits
-                if (i < attachments.length - 1) {
-                    await new Promise(r => setTimeout(r, 800));
+                // Scheduler ACK - Emit ONCE after the entire batch (attachments + text) is done
+                if (data.schedulerTracked && data.reqId) {
+                    socket.emit('scheduler_msg_sent', { reqId: data.reqId });
                 }
 
-                // Production-Grade Buffer Cleanup
-                mediaObject = null;
-                if (global.gc) global.gc();
-            } // end loop
+            } else {
+                // No attachments, just send text
+                console.log(`[WA-PRO] Sending text only...`);
+                
+                // Humanized Typing Simulation
+                try {
+                    const chat = await client.getChatById(targetChatId);
+                    await chat.sendStateTyping();
+                    const delayMs = Math.min(Math.max(msgText.length * 40, 1000), 4000); // 40ms per char, max 4s
+                    await new Promise(r => setTimeout(r, delayMs));
+                } catch(e) { /* ignore typing errors */ }
 
-            // If NO valid attachments were successfully sent, OR if the main text wasn't consumed as a caption, send it standalone
-            if ((!anySent && text) || (text && !textConsumed)) {
-                console.log(`[WA-PRO] Sending standalone text (Attachments sent: ${anySent}, consumed: ${textConsumed})`);
-                const textMsg = await client.sendMessage(chatId, text, sendOptions);
+                const textMsg = await client.sendMessage(targetChatId, msgText, sendOptions);
                 let notifyName = null;
                 try {
-                    const contact = await textMsg.getContact();
-                    notifyName = contact.pushname || contact.name;
+                    if (textMsg && typeof textMsg.getContact === 'function') {
+                        const contact = await textMsg.getContact();
+                        notifyName = contact.pushname || contact.name;
+                    }
                 } catch (cErr) { }
+                const safeWaId = textMsg?.id?._serialized || textMsg?.id?.id || (`WA_SENT_${Date.now()}`);
                 socket.emit('service_message_result', {
                     success: true,
-                    whatsappId: textMsg.id._serialized,
+                    whatsappId: safeWaId,
                     notifyName,
-                    originalData: { ...data, mediaUrl: null, mediaType: null, attachments: [] }
+                    queueId: data.queueId, // Pass back for Outbox confirmation
+                    originalData: { ...data, attachments: [] }
                 });
-                textMsg = null; // Explicit cleanup
+                // Scheduler ACK
+                if (data.schedulerTracked && data.reqId) {
+                    socket.emit('scheduler_msg_sent', { reqId: data.reqId });
+                }
+                console.log(`[WA-PRO] TEXT MESSAGE SENT SUCCESSFULLY. ID: ${safeWaId} Contact: ${notifyName}`);
             }
 
-            // Scheduler ACK - Emit ONCE after the entire batch (attachments + text) is done
-            if (data.schedulerTracked && data.reqId) {
-                socket.emit('scheduler_msg_sent', { reqId: data.reqId });
+        } catch (err) {
+            const errStack = err.stack || 'No Stack';
+            const errMsg = err.message || 'Unknown Error';
+            
+            console.error('[WA-PRO] FATAL SEND ERROR:', errMsg);
+            console.error('[WA-PRO] ERROR STACK:', errStack);
+            console.error('[WA-PRO] TARGET:', targetChatId);
+
+            // DYNAMIC RECOVERY: If frame is detached, the browser session is dead.
+            if (errMsg.includes('detached Frame') || errMsg.includes('Session closed')) {
+                console.error('[WA-PRO] ⚠️ CRITICAL: Browser session error. Triggering immediate aggressive recovery...');
+                triggerAggressiveRestart("Fatal Session Error (Detached Frame)");
             }
 
-        } else {
-            // No attachments, just send text
-            console.log(`[WA-PRO] Sending text only...`);
-            const textMsg = await client.sendMessage(chatId, text, sendOptions);
-            let notifyName = null;
-            try {
-                const contact = await textMsg.getContact();
-                notifyName = contact.pushname || contact.name;
-            } catch (cErr) { }
+            // SPECIFIC RECOVERY: The cryptic "t" error (Evaluation Failed)
+            if (errMsg === 't' || errMsg.includes('Evaluation failed')) {
+                consecutiveFatalErrors++;
+                console.error(`[WA-PRO] 🚨 Protocol "t" error detected (${consecutiveFatalErrors}/3).`);
+                
+                if (consecutiveFatalErrors >= 3) {
+                    console.error('[WA-PRO] 🆘 Persistent protocol failures. Triggering aggressive reset...');
+                    consecutiveFatalErrors = 0;
+                    triggerAggressiveRestart("Persistent Protocol Error (t)");
+                } else {
+                    // Try to pulse the state to keep it alive
+                    client.getState().catch(() => {});
+                }
+            }
+
+            // SPECIFIC RECOVERY: No LID for user (LID mapping failure)
+            if (errMsg.includes('No LID for user')) {
+                console.error(`[WA-PRO] ❌ LID RESOLUTION FAILURE for ${targetChatId}. Attempting automated recovery...`);
+                
+                if (targetChatId.endsWith('@c.us')) {
+                    console.log(`[WA-PRO] Retrying with @lid suffix as last resort...`);
+                    try {
+                        const lidAlt = `${targetChatId.split('@')[0]}@lid`;
+                        const recoveredMsg = await client.sendMessage(lidAlt, msgText || "(Recovery Fallback)", sendOptions);
+                        
+                        console.log(`[WA-PRO] ✅ Recovery successful using @lid suffix! Message ID: ${recoveredMsg.id._serialized}`);
+                        
+                        let notifyName = null;
+                        try {
+                            const contact = await recoveredMsg.getContact();
+                            notifyName = contact.pushname || contact.name;
+                        } catch (cErr) { }
+
+                        // Reset counter on success (if it was a partial success)
+                        consecutiveFatalErrors = 0;
+
+                        // MUST EMIT SUCCESS so the Hub clears this from the outbox queue
+                        socket.emit('service_message_result', {
+                            success: true,
+                            whatsappId: recoveredMsg.id._serialized,
+                            notifyName,
+                            queueId: data.queueId, // CRITICAL: This allows the Hub to delete it from outgoing_queue
+                            originalData: { ...data, targetChatId: lidAlt } // Mark updated JID
+                        });
+
+                        return; // Exit successfully
+                    } catch (e2) {
+                        console.error(`[WA-PRO] ❌ Recovery retry failed for LID: ${e2.message}`);
+                    }
+                }
+            }
+
             socket.emit('service_message_result', {
-                success: true,
-                whatsappId: textMsg.id._serialized,
-                notifyName,
-                originalData: { ...data, attachments: [] }
+                success: false,
+                error: errMsg,
+                queueId: data.queueId, // Ensure background retries know why it failed
+                originalData: data
             });
-            // Scheduler ACK
+            // Scheduler ACK for error
             if (data.schedulerTracked && data.reqId) {
-                socket.emit('scheduler_msg_sent', { reqId: data.reqId });
+                socket.emit('scheduler_msg_error', { reqId: data.reqId, error: errMsg });
             }
-            console.log(`[WA-PRO] TEXT MESSAGE SENT SUCCESSFULLY. Contact: ${notifyName}`);
+        } finally {
+            // Cleanup temp files
+            tempFiles.forEach(file => {
+                try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch (e) { }
+            });
         }
-
     } catch (err) {
-
-        console.error('[WA-PRO] FATAL SEND ERROR:', err.message);
-
-        // DYNAMIC RECOVERY: If frame is detached, the browser session is dead.
-        if (err.message.includes('detached Frame') || err.message.includes('Session closed')) {
-            console.error('[WA-PRO] ⚠️ CRITICAL: Browser session error. Resetting for auto-recovery...');
-            updateState('initial');
-            socket.emit('service_status_update', { state: 'initial', error: 'Browser Session Error - Recovering...' });
-        }
-
-        socket.emit('service_message_result', {
-            success: false,
-            error: err.message,
-            originalData: data
-        });
-        // Scheduler ACK for error
-        if (data.schedulerTracked && data.reqId) {
-            socket.emit('scheduler_msg_error', { reqId: data.reqId, error: err.message });
-        }
-    } finally {
-        // Cleanup temp files
-        tempFiles.forEach(file => {
-            try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch (e) { }
-        });
+        console.error('[WA-PRO] Outer Send Handler Error:', err.message);
     }
 });
 
@@ -895,6 +1234,15 @@ socket.on('service_sync_contacts', async (data = {}) => {
     const mode = data.mode || 'all';
     const groupId = data.groupId; // Capture groupId
     console.log(`[WA-Service] Starting ${mode} contact sync...`);
+    
+    // Emit immediate feedback so user knows process started
+    socket.emit('process_start', { 
+        title: 'Contact Synchronization', 
+        total: 100, // Placeholder until list is fetched
+        messageText: 'Preparing synchronization engine...' 
+    });
+    socket.emit('process_update', { message: 'Fetching contact list from WhatsApp... ⏳', type: 'info', current: 5 });
+
     try {
         let contacts;
         if (mode === 'chats') {
@@ -1007,8 +1355,20 @@ socket.on('service_fetch_more_history', async (data) => {
     console.log(`[WA-Service] Fetching ${limit} messages for ${chatId}${lastMsgId ? ' before ' + lastMsgId : ' (latest)'}`);
 
     try {
-        const finalChatId = chatId.includes('@') ? chatId : `${chatId}@c.us`;
-        const chat = await client.getChatById(finalChatId);
+        const finalChatId = await resolveChatId(chatId);
+        if (!finalChatId) throw new Error(`Invalid chatId: ${chatId}`);
+
+        let chat;
+        try {
+            chat = await client.getChatById(finalChatId);
+        } catch (e) {
+            if (e.message.includes('No LID') || e.message.includes('invalid')) {
+                console.warn(`[WA-Service] History resolution error for ${finalChatId}: ${e.message}. Returning empty cloud result.`);
+                socket.emit('service_history_result', { success: true, chatId, messages: [] });
+                return;
+            }
+            throw e;
+        }
         // If no lastMsgId, fetch the latest messages without a 'before' filter
         const fetchOptions = lastMsgId ? { limit, before: lastMsgId } : { limit };
         const messages = await chat.fetchMessages(fetchOptions);
@@ -1047,6 +1407,10 @@ socket.on('service_fetch_more_history', async (data) => {
             chatId,
             messages: mappedMessages
         });
+        // Start Enterprise Watchdog
+        startWatchdog();
+        
+        flushQueue();
     } catch (err) {
         console.error('[WA-Service] History fetch error:', err);
         socket.emit('service_history_result', { success: false, error: err.message, chatId });
@@ -1086,4 +1450,8 @@ socket.on('service_delete_message', async (data) => {
     }
 });
 
-robustInitialize().catch(err => console.error('[WA-Service] TOP-LEVEL Init error:', err));
+// Delay startup by 3 seconds to ensure Hub/Server is fully initialized
+console.log('[WA-Service] Waiting 3s for Hub initialization...');
+setTimeout(() => {
+    robustInitialize().catch(err => console.error('[WA-Service] TOP-LEVEL Init error:', err));
+}, 3000);

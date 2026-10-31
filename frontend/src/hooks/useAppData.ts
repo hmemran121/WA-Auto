@@ -43,7 +43,7 @@ export const useAppData = () => {
             try {
                 const response = await fetch('http://localhost:3001/messages');
                 const data = await response.json();
-                setMessageLogs(data.slice(0, 100).map((m: any) => ({
+                setMessageLogs(data.slice(0, 500).map((m: any) => ({
                     id: m.id.toString(),
                     whatsappId: m.whatsapp_id || m.whatsappId,
                     contactId: '0',

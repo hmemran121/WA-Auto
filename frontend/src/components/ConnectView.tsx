@@ -129,10 +129,12 @@ const ConnectView: React.FC<ConnectViewProps> = ({ isConnected, setIsConnected, 
             exit={{ opacity: 0, scale: 1.05, filter: 'blur(10px)' }}
             className="max-w-4xl mx-auto"
           >
-            <div className="bg-white/70 backdrop-blur-3xl rounded-[2.5rem] shadow-[0_32px_64px_-16px_rgba(0,0,0,0.1)] border border-emerald-100/50 p-12 overflow-hidden relative">
-              {/* Background Accents */}
-              <div className="absolute top-0 right-0 w-64 h-64 bg-emerald-400/10 blur-[100px] rounded-full -mr-32 -mt-32"></div>
-              <div className="absolute bottom-0 left-0 w-48 h-48 bg-teal-400/10 blur-[80px] rounded-full -ml-24 -mb-24"></div>
+            <div className="bg-white/70 backdrop-blur-3xl rounded-[2.5rem] shadow-[0_32px_64px_-16px_rgba(0,0,0,0.1)] border border-emerald-100/50 p-12 relative">
+              {/* Background Accents (Clipped separately to allow dropdown pop-outs) */}
+              <div className="absolute inset-0 rounded-[2.5rem] overflow-hidden pointer-events-none">
+                <div className="absolute top-0 right-0 w-64 h-64 bg-emerald-400/10 blur-[100px] rounded-full -mr-32 -mt-32"></div>
+                <div className="absolute bottom-0 left-0 w-48 h-48 bg-teal-400/10 blur-[80px] rounded-full -ml-24 -mb-24"></div>
+              </div>
 
               <div className="flex flex-col md:flex-row items-center gap-12 relative z-10">
                 <div className="flex-shrink-0 text-center">

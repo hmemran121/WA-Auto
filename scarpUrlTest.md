@@ -27,7 +27,7 @@
 প্রডাক্ট লিংক গুলো নিচে দেয়া হলো....
 
 
-    https://sailor.clothing/details/rb-ef62-bmscs-20371-44471
+    https://sailor.clothing/details/rb-ef62-bmscs-20371-44471  161
     https://sailor.clothing/details/ky-ef61-hwwlk-00321-41107
 
     https://turaag.com/products/atlas-women-s-track-jacket-1
